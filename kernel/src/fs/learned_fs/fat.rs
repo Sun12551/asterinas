@@ -3,9 +3,9 @@
 use core::mem::size_of;
 
 use super::{
-    bitmap::ExfatBitmap,
+    bitmap::LearnedBitmap,
     constants::{EXFAT_FIRST_CLUSTER, EXFAT_RESERVED_CLUSTERS},
-    fs::ExfatFS,
+    fs::LearnedFS,
 };
 use crate::prelude::*;
 
@@ -63,7 +63,7 @@ pub struct ExfatChain {
     num_clusters: u32,
     // use FAT or not
     flags: FatChainFlags,
-    fs: Weak<ExfatFS>,
+    fs: Weak<LearnedFS>,
 }
 
 // A position by the chain and relative offset in the cluster.
@@ -71,7 +71,7 @@ pub type ExfatChainPosition = (ExfatChain, usize);
 
 impl ExfatChain {
     pub(super) fn new(
-        fs: Weak<ExfatFS>,
+        fs: Weak<LearnedFS>,
         current: ClusterID,
         num_clusters: Option<u32>,
         flags: FatChainFlags,
@@ -120,7 +120,7 @@ impl ExfatChain {
         self.flags = flags;
     }
 
-    fn fs(&self) -> Arc<ExfatFS> {
+    fn fs(&self) -> Arc<LearnedFS> {
         self.fs.upgrade().unwrap()
     }
 
@@ -202,7 +202,7 @@ impl ExfatChain {
     fn alloc_cluster_from_empty(
         &mut self,
         num_to_be_allocated: u32,
-        bitmap: &mut MutexGuard<ExfatBitmap>,
+        bitmap: &mut MutexGuard<LearnedBitmap>,
         sync_bitmap: bool,
     ) -> Result<ClusterID> {
         // Search for a continuous chunk big enough
@@ -228,7 +228,7 @@ impl ExfatChain {
         &mut self,
         num_to_be_allocated: u32,
         sync: bool,
-        bitmap: &mut MutexGuard<ExfatBitmap>,
+        bitmap: &mut MutexGuard<LearnedBitmap>,
     ) -> Result<ClusterID> {
         let fs = self.fs();
         let mut alloc_start_cluster = 0;
@@ -255,7 +255,7 @@ impl ExfatChain {
         start_physical_cluster: ClusterID,
         drop_num: u32,
         sync_bitmap: bool,
-        bitmap: &mut MutexGuard<ExfatBitmap>,
+        bitmap: &mut MutexGuard<LearnedBitmap>,
     ) -> Result<()> {
         let fs = self.fs();
 

@@ -8,7 +8,7 @@ use crate::prelude::*;
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 // The in-memory superblock info
-pub struct ExfatSuperBlock {
+pub struct LearnedSuperBlock {
     /// num of sectors in volume
     pub num_sectors: u64,
     /// num of clusters in volume
@@ -45,11 +45,11 @@ pub struct ExfatSuperBlock {
 
 const DENTRY_SIZE_BITS: u32 = 5;
 
-impl TryFrom<ExfatBootSector> for ExfatSuperBlock {
+impl TryFrom<LearnedBootSector> for LearnedSuperBlock {
     type Error = crate::error::Error;
-    fn try_from(sector: ExfatBootSector) -> Result<ExfatSuperBlock> {
+    fn try_from(sector: LearnedBootSector) -> Result<LearnedSuperBlock> {
         const EXFAT_CLUSTERS_UNTRACKED: u32 = !0;
-        let mut block = ExfatSuperBlock {
+        let mut block = LearnedSuperBlock {
             sect_per_cluster_bits: sector.sector_per_cluster_bits as u32,
             sect_per_cluster: 1 << sector.sector_per_cluster_bits as u32,
 
@@ -79,7 +79,7 @@ impl TryFrom<ExfatBootSector> for ExfatSuperBlock {
                     - DENTRY_SIZE_BITS),
         };
 
-        if block.num_fat_sectors == 2 {
+        if sector.num_fats == 2 {
             block.fat2_start_sector += block.num_fat_sectors as u64;
         }
 
@@ -93,26 +93,26 @@ pub const BOOTSEC_OLDBPB_LEN: usize = 53;
 // EXFAT: Main and Backup Boot Sector (512 bytes)
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct ExfatBootSector {
+pub(super) struct LearnedBootSector {
     pub jmp_boot: [u8; BOOTSEC_JUMP_BOOT_LEN],
     pub fs_name: [u8; BOOTSEC_FS_NAME_LEN],
     pub must_be_zero: [u8; BOOTSEC_OLDBPB_LEN],
-    pub partition_offset: u64,
-    pub vol_length: u64,
-    pub fat_offset: u32,
-    pub fat_length: u32,
-    pub cluster_offset: u32,
-    pub cluster_count: u32,
-    pub root_cluster: u32,
-    pub vol_serial: u32,
-    pub fs_revision: [u8; 2],
-    pub vol_flags: u16,
-    pub sector_size_bits: u8,
-    pub sector_per_cluster_bits: u8,
-    pub num_fats: u8,
-    pub drv_sel: u8,
-    pub percent_in_use: u8,
+    pub partition_offset: u64, //not used
+    pub vol_length: u64, //sector的总个数
+    pub fat_offset: u32, //FAT的起始sector
+    pub fat_length: u32, //FAT的长度，单位是sector
+    pub cluster_offset: u32, //数据区的起始sector
+    pub cluster_count: u32, //cluster的个数，不包括reserved cluster
+    pub root_cluster: u32, //根目录的起始cluster
+    pub vol_serial: u32, //not used
+    pub fs_revision: [u8; 2], //not used
+    pub vol_flags: u16, //卷标的标志位
+    pub sector_size_bits: u8, //描述sector的大小
+    pub sector_per_cluster_bits: u8, //描述每个cluster内的sector的个数
+    pub num_fats: u8, // FAT的个数
+    pub drv_sel: u8, //not used
+    pub percent_in_use: u8, //not used
     pub reserved: [u8; 7],
-    pub boot_code: [u8; 390],
-    pub signature: u16,
+    pub boot_code: [u8; 390], //not used
+    pub signature: u16, //文件系统的签名
 }

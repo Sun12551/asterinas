@@ -18,17 +18,17 @@ use ostd::mm::{Segment, VmIo};
 use super::{
     constants::*,
     dentry::{
-        Checksum, ExfatDentry, ExfatDentrySet, ExfatFileDentry, ExfatName, RawExfatDentry,
+        Checksum, ExfatDentry, ExfatDentrySet, ExfatFileDentry, LearnedName, RawExfatDentry,
         DENTRY_SIZE,
     },
     fat::{ClusterAllocator, ClusterID, ExfatChainPosition, FatChainFlags},
-    fs::{ExfatMountOptions, EXFAT_ROOT_INO},
+    fs::{ExfatMountOptions, LEARNED_ROOT_INO},
     utils::{make_hash_index, DosTimestamp},
 };
 use crate::{
     events::IoEvents,
     fs::{
-        learned_fs::{dentry::ExfatDentryIterator, fat::ExfatChain, fs::ExfatFS},
+        learned_fs::{dentry::ExfatDentryIterator, fat::ExfatChain, fs::LearnedFS},
         path::{is_dot, is_dot_or_dotdot, is_dotdot},
         utils::{
             CachePage, DirentVisitor, Extension, Inode, InodeMode, InodeType, IoctlCmd, Metadata,
@@ -77,13 +77,13 @@ impl FatAttr {
 }
 
 #[derive(Debug)]
-pub struct ExfatInode {
-    inner: RwMutex<ExfatInodeInner>,
+pub struct LearnedInode {
+    inner: RwMutex<LearnedInodeInner>,
     extension: Extension,
 }
 
 #[derive(Debug)]
-struct ExfatInodeInner {
+struct LearnedInodeInner {
     /// Inode number.
     ino: Ino,
 
@@ -119,7 +119,7 @@ struct ExfatInodeInner {
     num_sub_dirs: u32,
 
     /// ExFAT uses UTF-16 encoding, rust use utf-8 for string processing.
-    name: ExfatName,
+    name: LearnedName,
 
     /// Flag for whether the inode is deleted.
     is_deleted: bool,
@@ -128,14 +128,14 @@ struct ExfatInodeInner {
     parent_hash: usize,
 
     /// A pointer to exFAT fs.
-    fs: Weak<ExfatFS>,
+    fs: Weak<LearnedFS>,
 
     /// Important: To enlarge the page_cache, we need to update the page_cache size before we update the size of inode, to avoid extra data read.
     /// To shrink the page_cache, we need to update the page_cache size after we update the size of inode, to avoid extra data write.
     page_cache: PageCache,
 }
 
-impl PageCacheBackend for ExfatInode {
+impl PageCacheBackend for LearnedInode {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
         if inner.size < idx * PAGE_SIZE {
@@ -177,11 +177,12 @@ impl PageCacheBackend for ExfatInode {
     }
 }
 
-impl ExfatInodeInner {
+impl LearnedInodeInner {
     /// The hash_value to index inode. This should be unique in the whole fs.
     /// Currently use dentry set physical position as hash value except for root(0).
+    /// TODO: Why not use inode number as hash value?
     fn hash_index(&self) -> usize {
-        if self.ino == EXFAT_ROOT_INO {
+        if self.ino == LEARNED_ROOT_INO {
             return ROOT_INODE_HASH;
         }
 
@@ -191,7 +192,7 @@ impl ExfatInodeInner {
         )
     }
 
-    fn get_parent_inode(&self) -> Option<Arc<ExfatInode>> {
+    fn get_parent_inode(&self) -> Option<Arc<LearnedInode>> {
         //FIXME: What if parent inode is evicted? How can I find it?
         self.fs().find_opened_inode(self.parent_hash)
     }
@@ -225,7 +226,7 @@ impl ExfatInodeInner {
         false
     }
 
-    fn fs(&self) -> Arc<ExfatFS> {
+    fn fs(&self) -> Arc<LearnedFS> {
         self.fs.upgrade().unwrap()
     }
 
@@ -299,7 +300,7 @@ impl ExfatInodeInner {
     /// Should lock the file system before calling this function.
     fn write_inode(&self, sync: bool, fs_guard: &MutexGuard<()>) -> Result<()> {
         // Root dir should not be updated.
-        if self.ino == EXFAT_ROOT_INO {
+        if self.ino == LEARNED_ROOT_INO {
             return Ok(());
         }
 
@@ -451,7 +452,7 @@ impl ExfatInodeInner {
         } else {
             // Otherwise, create a new node and insert it to hash map.
             let ino = fs.alloc_inode_number();
-            let child_inode = ExfatInode::read_from_iterator(
+            let child_inode = LearnedInode::read_from_iterator(
                 fs.clone(),
                 offset / DENTRY_SIZE,
                 dentry_position,
@@ -481,14 +482,10 @@ impl ExfatInodeInner {
         target_name: &str,
         case_sensitive: bool,
         fs_guard: &MutexGuard<()>,
-    ) -> Result<Arc<ExfatInode>> {
+    ) -> Result<Arc<LearnedInode>> {
         let fs = self.fs();
 
-        let target_upcase = if !case_sensitive {
-            fs.upcase_table().lock().str_to_upcase(target_name)?
-        } else {
-            target_name.to_string()
-        };
+        let target_upcase = target_name.to_string();
 
         // FIXME: This isn't expected by the compiler.
         // #[expect(non_local_definitions)]
@@ -514,11 +511,7 @@ impl ExfatInodeInner {
         )?;
 
         for (name, offset) in name_and_offsets {
-            let name_upcase = if !case_sensitive {
-                fs.upcase_table().lock().str_to_upcase(&name)?
-            } else {
-                name
-            };
+            let name_upcase = name;
 
             if name_upcase.eq(&target_upcase) {
                 let chain_off = self.start_chain.walk_to_cluster_at_offset(offset)?;
@@ -615,7 +608,7 @@ impl ExfatInodeInner {
     }
 }
 
-impl ExfatInode {
+impl LearnedInode {
     // TODO: Should be called when inode is evicted from fs.
     pub(super) fn reclaim_space(&self) -> Result<()> {
         let inner = self.inner.write();
@@ -635,12 +628,10 @@ impl ExfatInode {
     }
 
     pub(super) fn build_root_inode(
-        fs_weak: Weak<ExfatFS>,
+        fs_weak: Weak<LearnedFS>,
         root_chain: ExfatChain,
-    ) -> Result<Arc<ExfatInode>> {
+    ) -> Result<Arc<LearnedInode>> {
         let sb = fs_weak.upgrade().unwrap().super_block();
-
-        let root_cluster = sb.root_dir;
 
         let dentry_set_size = 0;
 
@@ -652,11 +643,11 @@ impl ExfatInode {
 
         let size = root_chain.num_clusters() as usize * sb.cluster_size as usize;
 
-        let name = ExfatName::new();
+        let name = LearnedName::new();
 
-        let inode = Arc::new_cyclic(|weak_self| ExfatInode {
-            inner: RwMutex::new(ExfatInodeInner {
-                ino: EXFAT_ROOT_INO,
+        let inode = Arc::new_cyclic(|weak_self| LearnedInode {
+            inner: RwMutex::new(LearnedInodeInner {
+                ino: LEARNED_ROOT_INO,
                 dentry_set_position: ExfatChainPosition::default(),
                 dentry_set_size: 0,
                 dentry_entry: 0,
@@ -694,13 +685,13 @@ impl ExfatInode {
     }
 
     fn build_from_dentry_set(
-        fs: Arc<ExfatFS>,
+        fs: Arc<LearnedFS>,
         dentry_set: &ExfatDentrySet,
         dentry_set_position: ExfatChainPosition,
         dentry_entry: u32,
         parent_hash: usize,
         fs_guard: &MutexGuard<()>,
-    ) -> Result<Arc<ExfatInode>> {
+    ) -> Result<Arc<LearnedInode>> {
         const EXFAT_MINIMUM_DENTRY: usize = 3;
 
         let ino = fs.alloc_inode_number();
@@ -763,9 +754,9 @@ impl ExfatInode {
             chain_flag,
         )?;
 
-        let name = dentry_set.get_name(fs.upcase_table())?;
-        let inode = Arc::new_cyclic(|weak_self| ExfatInode {
-            inner: RwMutex::new(ExfatInodeInner {
+        let name = dentry_set.get_name()?;
+        let inode = Arc::new_cyclic(|weak_self| LearnedInode {
+            inner: RwMutex::new(LearnedInodeInner {
                 ino,
                 dentry_set_position,
                 dentry_set_size,
@@ -804,7 +795,7 @@ impl ExfatInode {
 
     /// The caller of the function should give a unique ino to assign to the inode.
     pub(super) fn read_from_iterator(
-        fs: Arc<ExfatFS>,
+        fs: Arc<LearnedFS>,
         dentry_entry: usize,
         chain_pos: ExfatChainPosition,
         file_dentry: &ExfatFileDentry,
@@ -891,7 +882,7 @@ impl ExfatInode {
         inode_type: InodeType,
         mode: InodeMode,
         fs_guard: &MutexGuard<()>,
-    ) -> Result<Arc<ExfatInode>> {
+    ) -> Result<Arc<LearnedInode>> {
         if name.len() > MAX_NAME_LENGTH {
             return_errno!(Errno::ENAMETOOLONG)
         }
@@ -926,7 +917,7 @@ impl ExfatInode {
 
         let pos = inner.start_chain.walk_to_cluster_at_offset(start_off)?;
 
-        let new_inode = ExfatInode::build_from_dentry_set(
+        let new_inode = LearnedInode::build_from_dentry_set(
             fs.clone(),
             &dentry_set,
             pos,
@@ -987,7 +978,7 @@ impl ExfatInode {
     /// Copy metadata from the given inode.
     /// There will be no deadlock since this function is only used in rename and the arg "inode".
     /// is a temporary inode which is only accessible to current thread.
-    fn copy_metadata_from(&self, inode: Arc<ExfatInode>) {
+    fn copy_metadata_from(&self, inode: Arc<LearnedInode>) {
         let mut self_inner = self.inner.write();
         let other_inner = inode.inner.read();
 
@@ -1042,7 +1033,7 @@ impl ExfatInode {
     /// Delete the file contents if delete_content is set.
     fn delete_inode(
         &self,
-        inode: Arc<ExfatInode>,
+        inode: Arc<LearnedInode>,
         delete_contents: bool,
         fs_guard: &MutexGuard<()>,
     ) -> Result<()> {
@@ -1078,8 +1069,8 @@ fn is_block_aligned(off: usize) -> bool {
 }
 
 fn check_corner_cases_for_rename(
-    old_inode: &Arc<ExfatInode>,
-    exist_inode: &Arc<ExfatInode>,
+    old_inode: &Arc<LearnedInode>,
+    exist_inode: &Arc<LearnedInode>,
 ) -> Result<()> {
     // Check for two corner cases here.
     let old_inode_is_dir = old_inode.inner.read().inode_type.is_directory();
@@ -1094,7 +1085,7 @@ fn check_corner_cases_for_rename(
     Ok(())
 }
 
-impl Inode for ExfatInode {
+impl Inode for LearnedInode {
     fn ino(&self) -> u64 {
         self.inner.read().ino
     }
@@ -1608,7 +1599,7 @@ impl Inode for ExfatInode {
         if old_name.len() > MAX_NAME_LENGTH || new_name.len() > MAX_NAME_LENGTH {
             return_errno!(Errno::ENAMETOOLONG)
         }
-        let Some(target_) = target.downcast_ref::<ExfatInode>() else {
+        let Some(target_) = target.downcast_ref::<LearnedInode>() else {
             return_errno_with_message!(Errno::EINVAL, "not an exfat inode")
         };
         if !self.inner.read().inode_type.is_directory()
@@ -1620,9 +1611,7 @@ impl Inode for ExfatInode {
         let fs = self.inner.read().fs();
         let fs_guard = fs.lock();
         // Rename something to itself, return success directly.
-        let up_old_name = fs.upcase_table().lock().str_to_upcase(old_name)?;
-        let up_new_name = fs.upcase_table().lock().str_to_upcase(new_name)?;
-        if self.inner.read().ino == target_.inner.read().ino && up_old_name.eq(&up_new_name) {
+        if self.inner.read().ino == target_.inner.read().ino && old_name.eq(new_name) {
             return Ok(());
         }
 

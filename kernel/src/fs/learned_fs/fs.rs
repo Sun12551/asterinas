@@ -16,36 +16,32 @@ use ostd::mm::Segment;
 pub(super) use ostd::mm::VmIo;
 
 use super::{
-    bitmap::ExfatBitmap,
+    bitmap::LearnedBitmap,
     fat::{ClusterID, ExfatChain, FatChainFlags, FatValue, FAT_ENTRY_SIZE},
-    inode::ExfatInode,
-    super_block::{ExfatBootSector, ExfatSuperBlock},
-    upcase_table::ExfatUpcaseTable,
+    inode::LearnedInode,
+    super_block::{LearnedBootSector, LearnedSuperBlock},
+    constants::*,
+    inode::Ino,
 };
-// 这种形式的use不如直接放到super里，fs、bitmap、inode、upcase_table
+
 use crate::{
-    fs::{
-        learned_fs::{constants::*, inode::Ino},
-        utils::{CachePage, FileSystem, FsFlags, Inode, PageCache, PageCacheBackend, SuperBlock},
-    },
+    fs::utils::{CachePage, FileSystem, FsFlags, Inode, PageCache, PageCacheBackend, SuperBlock},
     prelude::*,
 };
 
 #[derive(Debug)]
-pub struct ExfatFS {
+pub struct LearnedFS {
     block_device: Arc<dyn BlockDevice>,
-    super_block: ExfatSuperBlock,
+    super_block: LearnedSuperBlock,
 
-    bitmap: Arc<Mutex<ExfatBitmap>>,
-
-    upcase_table: Arc<SpinLock<ExfatUpcaseTable>>,
+    bitmap: Arc<Mutex<LearnedBitmap>>,
 
     mount_option: ExfatMountOptions,
     //Used for inode allocation.
-    highest_inode_number: AtomicU64,
+    next_alloc_inode_number: AtomicU64,
 
     //inodes are indexed by their hash_value.
-    inodes: RwMutex<HashMap<usize, Arc<ExfatInode>>>,
+    inodes: RwMutex<HashMap<usize, Arc<LearnedInode>>>,
 
     //Cache for fat table
     fat_cache: RwLock<LruCache<ClusterID, ClusterID>>,
@@ -57,9 +53,9 @@ pub struct ExfatFS {
 
 const FAT_LRU_CACHE_SIZE: usize = 1024;
 
-pub(super) const EXFAT_ROOT_INO: Ino = 1;
+pub(super) const LEARNED_ROOT_INO: Ino = 1;
 
-impl ExfatFS {
+impl LearnedFS {
     pub fn open(
         block_device: Arc<dyn BlockDevice>,
         mount_option: ExfatMountOptions,
@@ -67,13 +63,12 @@ impl ExfatFS {
         // Load the super_block
         let super_block = Self::read_super_block(block_device.as_ref())?;
         let fs_size = super_block.num_clusters as usize * super_block.cluster_size as usize;
-        let exfat_fs = Arc::new_cyclic(|weak_self| ExfatFS {
+        let exfat_fs = Arc::new_cyclic(|weak_self| LearnedFS {
             block_device,
             super_block,
-            bitmap: Arc::new(Mutex::new(ExfatBitmap::default())),
-            upcase_table: Arc::new(SpinLock::new(ExfatUpcaseTable::empty())),
+            bitmap: Arc::new(Mutex::new(LearnedBitmap::default())),
             mount_option,
-            highest_inode_number: AtomicU64::new(EXFAT_ROOT_INO + 1),
+            next_alloc_inode_number: AtomicU64::new(LEARNED_ROOT_INO + 1),
             inodes: RwMutex::new(HashMap::new()),
             fat_cache: RwLock::new(LruCache::<ClusterID, ClusterID>::new(
                 NonZeroUsize::new(FAT_LRU_CACHE_SIZE).unwrap(),
@@ -96,22 +91,15 @@ impl ExfatFS {
             FatChainFlags::ALLOC_POSSIBLE,
         )?;
 
-        let root = ExfatInode::build_root_inode(weak_fs.clone(), root_chain.clone())?;
+        let root = LearnedInode::build_root_inode(weak_fs.clone(), root_chain.clone())?;
 
-        let upcase_table = ExfatUpcaseTable::load(
-            weak_fs.clone(),
-            root.page_cache().unwrap(),
-            root_chain.clone(),
-        )?;
-
-        let bitmap = ExfatBitmap::load(
+        let bitmap = LearnedBitmap::load(
             weak_fs.clone(),
             root.page_cache().unwrap(),
             root_chain.clone(),
         )?;
 
         *exfat_fs.bitmap.lock() = bitmap;
-        *exfat_fs.upcase_table.lock() = upcase_table;
 
         // TODO: Handle UTF-8
 
@@ -123,11 +111,11 @@ impl ExfatFS {
     }
 
     pub(super) fn alloc_inode_number(&self) -> Ino {
-        self.highest_inode_number
+        self.next_alloc_inode_number
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(super) fn find_opened_inode(&self, hash: usize) -> Option<Arc<ExfatInode>> {
+    pub(super) fn find_opened_inode(&self, hash: usize) -> Option<Arc<LearnedInode>> {
         self.inodes.read().get(&hash).cloned()
     }
 
@@ -147,7 +135,7 @@ impl ExfatFS {
         Ok(())
     }
 
-    pub(super) fn insert_inode(&self, inode: Arc<ExfatInode>) -> Option<Arc<ExfatInode>> {
+    pub(super) fn insert_inode(&self, inode: Arc<LearnedInode>) -> Option<Arc<LearnedInode>> {
         self.inodes.write().insert(inode.hash_index(), inode)
     }
 
@@ -176,7 +164,7 @@ impl ExfatFS {
             }
         }
 
-        let sb: ExfatSuperBlock = self.super_block();
+        let sb: LearnedSuperBlock = self.super_block();
         let sector_size = sb.sector_size;
 
         if !self.is_valid_cluster(cluster) {
@@ -200,7 +188,7 @@ impl ExfatFS {
         value: FatValue,
         sync: bool,
     ) -> Result<()> {
-        let sb: ExfatSuperBlock = self.super_block();
+        let sb: LearnedSuperBlock = self.super_block();
         let sector_size = sb.sector_size;
         let raw_value: u32 = value.into();
 
@@ -234,14 +222,14 @@ impl ExfatFS {
         Ok(())
     }
 
-    fn read_super_block(block_device: &dyn BlockDevice) -> Result<ExfatSuperBlock> {
-        let boot_sector = block_device.read_val::<ExfatBootSector>(0)?;
+    fn read_super_block(block_device: &dyn BlockDevice) -> Result<LearnedSuperBlock> {
+        let boot_sector = block_device.read_val::<LearnedBootSector>(0)?;
         /* Check the validity of BOOT */
         if boot_sector.signature != BOOT_SIGNATURE {
             return_errno_with_message!(Errno::EINVAL, "invalid boot record signature");
         }
 
-        if !boot_sector.fs_name.eq(STR_EXFAT.as_bytes()) {
+        if !boot_sector.fs_name.eq(STR_LEARNED.as_bytes()) {
             return_errno_with_message!(Errno::EINVAL, "invalid fs name");
         }
 
@@ -271,7 +259,7 @@ impl ExfatFS {
             return_errno_with_message!(Errno::EINVAL, "bogus sector size bits per cluster");
         }
 
-        let super_block = ExfatSuperBlock::try_from(boot_sector)?;
+        let super_block = LearnedSuperBlock::try_from(boot_sector)?;
 
         /* Check consistencies */
         if ((super_block.num_fat_sectors as u64) << boot_sector.sector_size_bits)
@@ -300,7 +288,7 @@ impl ExfatFS {
         Ok(super_block)
     }
 
-    fn calibrate_blocksize(super_block: &ExfatSuperBlock, logical_sec: u32) -> Result<()> {
+    fn calibrate_blocksize(super_block: &LearnedSuperBlock, logical_sec: u32) -> Result<()> {
         // TODO: logical_sect should be larger than block_size.
         Ok(())
     }
@@ -309,19 +297,15 @@ impl ExfatFS {
         self.block_device.as_ref()
     }
 
-    pub(super) fn super_block(&self) -> ExfatSuperBlock {
+    pub(super) fn super_block(&self) -> LearnedSuperBlock {
         self.super_block
     }
 
-    pub(super) fn bitmap(&self) -> Arc<Mutex<ExfatBitmap>> {
+    pub(super) fn bitmap(&self) -> Arc<Mutex<LearnedBitmap>> {
         self.bitmap.clone()
     }
 
-    pub(super) fn upcase_table(&self) -> Arc<SpinLock<ExfatUpcaseTable>> {
-        self.upcase_table.clone()
-    }
-
-    pub(super) fn root_inode(&self) -> Arc<ExfatInode> {
+    pub(super) fn root_inode(&self) -> Arc<LearnedInode> {
         self.inodes.read().get(&ROOT_INODE_HASH).unwrap().clone()
     }
 
@@ -352,7 +336,7 @@ impl ExfatFS {
     }
 
     pub(super) fn is_valid_cluster(&self, cluster: u32) -> bool {
-        cluster >= EXFAT_RESERVED_CLUSTERS && cluster <= self.super_block.num_clusters
+        cluster >= EXFAT_RESERVED_CLUSTERS && cluster < self.super_block.num_clusters
     }
 
     pub(super) fn is_cluster_range_valid(&self, clusters: Range<ClusterID>) -> bool {
@@ -368,7 +352,7 @@ impl ExfatFS {
     }
 }
 
-impl PageCacheBackend for ExfatFS {
+impl PageCacheBackend for LearnedFS {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         if self.fs_size() < idx * PAGE_SIZE {
             return_errno_with_message!(Errno::EINVAL, "invalid read size")
@@ -402,7 +386,7 @@ impl PageCacheBackend for ExfatFS {
     }
 }
 
-impl FileSystem for ExfatFS {
+impl FileSystem for LearnedFS {
     fn sync(&self) -> Result<()> {
         for inode in self.inodes.read().values() {
             inode.sync_all()?;

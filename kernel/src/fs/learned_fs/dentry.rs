@@ -8,9 +8,8 @@ use ostd::mm::VmIo;
 use super::{
     constants::{EXFAT_FILE_NAME_LEN, MAX_NAME_LENGTH},
     fat::FatChainFlags,
-    fs::ExfatFS,
+    fs::LearnedFS,
     inode::FatAttr,
-    upcase_table::ExfatUpcaseTable,
     utils::{calc_checksum_16, DosTimestamp},
 };
 use crate::{
@@ -217,7 +216,7 @@ impl ExfatDentrySet {
     }
 
     pub(super) fn from(
-        fs: Arc<ExfatFS>,
+        fs: Arc<LearnedFS>,
         name: &str,
         inode_type: InodeType,
         _mode: InodeMode,
@@ -230,7 +229,7 @@ impl ExfatDentrySet {
             }
         };
 
-        let name = ExfatName::from_str(name, fs.upcase_table())?;
+        let name = LearnedName::from_str(name)?;
         let mut name_dentries = name.to_dentries();
 
         let dos_time = DosTimestamp::now()?;
@@ -382,8 +381,7 @@ impl ExfatDentrySet {
 
     pub(super) fn get_name(
         &self,
-        upcase_table: Arc<SpinLock<ExfatUpcaseTable>>,
-    ) -> Result<ExfatName> {
+    ) -> Result<LearnedName> {
         let name_dentries: Vec<ExfatNameDentry> = self
             .dentries
             .iter()
@@ -396,7 +394,7 @@ impl ExfatDentrySet {
             })
             .collect();
 
-        let name = ExfatName::from_name_dentries(&name_dentries, upcase_table)?;
+        let name = LearnedName::from_name_dentries(&name_dentries)?;
         if name.checksum() != self.get_stream_dentry().name_hash {
             return_errno_with_message!(Errno::EINVAL, "name hash mismatched")
         }
@@ -637,20 +635,19 @@ pub(super) struct ExfatDeletedDentry {
 }
 
 #[derive(Default, Debug)]
-pub(super) struct ExfatName(Vec<UTF16Char>);
+pub(super) struct LearnedName(Vec<UTF16Char>);
 
-impl ExfatName {
+impl LearnedName {
     pub fn from_name_dentries(
         names: &[ExfatNameDentry],
-        upcase_table: Arc<SpinLock<ExfatUpcaseTable>>,
     ) -> Result<Self> {
-        let mut exfat_name = ExfatName::new();
+        let mut exfat_name = LearnedName::new();
         for name in names {
             for value in name.unicode_0_14 {
                 if value == 0 {
                     return Ok(exfat_name);
                 }
-                exfat_name.push_char(value, upcase_table.clone())?;
+                exfat_name.push_char(value)?;
             }
         }
         Ok(exfat_name)
@@ -659,13 +656,11 @@ impl ExfatName {
     fn push_char(
         &mut self,
         value: UTF16Char,
-        _upcase_table: Arc<SpinLock<ExfatUpcaseTable>>,
     ) -> Result<()> {
         if !Self::is_valid_char(value) {
             return_errno_with_message!(Errno::EINVAL, "not a valid char")
         }
         self.0.push(value);
-        // self.0.push(upcase_table.lock().transform_char_to_upcase(value)?);
         Ok(())
     }
 
@@ -695,15 +690,14 @@ impl ExfatName {
         calc_checksum_16(&bytes, EMPTY_RANGE, 0)
     }
 
-    pub fn from_str(name: &str, _upcase_table: Arc<SpinLock<ExfatUpcaseTable>>) -> Result<Self> {
-        let name = ExfatName(name.encode_utf16().collect());
-        // upcase_table.lock().transform_to_upcase(&mut name.0)?;
+    pub fn from_str(name: &str) -> Result<Self> {
+        let name = LearnedName(name.encode_utf16().collect());
         name.verify()?;
         Ok(name)
     }
 
     pub fn new() -> Self {
-        ExfatName(Vec::new())
+        LearnedName(Vec::new())
     }
 
     pub fn to_dentries(&self) -> Vec<ExfatDentry> {
@@ -736,14 +730,14 @@ impl ExfatName {
     }
 }
 
-impl Display for ExfatName {
+impl Display for LearnedName {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", String::from_utf16_lossy(&self.0))
     }
 }
 
-impl Clone for ExfatName {
+impl Clone for LearnedName {
     fn clone(&self) -> Self {
-        ExfatName(self.0.clone())
+        LearnedName(self.0.clone())
     }
 }

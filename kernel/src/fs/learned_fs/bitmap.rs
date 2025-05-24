@@ -13,7 +13,7 @@ use super::{
     constants::EXFAT_RESERVED_CLUSTERS,
     dentry::{ExfatBitmapDentry, ExfatDentry, ExfatDentryIterator},
     fat::{ClusterID, ExfatChain},
-    fs::ExfatFS,
+    fs::LearnedFS,
 };
 use crate::{fs::learned_fs::fat::FatChainFlags, prelude::*, vm::vmo::Vmo};
 
@@ -23,7 +23,7 @@ type BitStore = u8;
 const BITS_PER_BYTE: usize = 8;
 
 #[derive(Debug, Default)]
-pub(super) struct ExfatBitmap {
+pub(super) struct LearnedBitmap {
     // Start cluster of allocation bitmap.
     chain: ExfatChain,
     bitvec: BitVec<BitStore>,
@@ -31,12 +31,12 @@ pub(super) struct ExfatBitmap {
 
     // Used to track the number of free clusters.
     num_free_cluster: u32,
-    fs: Weak<ExfatFS>,
+    fs: Weak<LearnedFS>,
 }
 
-impl ExfatBitmap {
+impl LearnedBitmap {
     pub(super) fn load(
-        fs_weak: Weak<ExfatFS>,
+        fs_weak: Weak<LearnedFS>,
         root_page_cache: Vmo<Full>,
         root_chain: ExfatChain,
     ) -> Result<Self> {
@@ -55,7 +55,7 @@ impl ExfatBitmap {
         return_errno_with_message!(Errno::EINVAL, "bitmap not found")
     }
 
-    fn load_bitmap_from_dentry(fs_weak: Weak<ExfatFS>, dentry: &ExfatBitmapDentry) -> Result<Self> {
+    fn load_bitmap_from_dentry(fs_weak: Weak<LearnedFS>, dentry: &ExfatBitmapDentry) -> Result<Self> {
         let fs = fs_weak.upgrade().unwrap();
         let num_clusters = (dentry.size as usize).align_up(fs.cluster_size()) / fs.cluster_size();
 
@@ -74,7 +74,7 @@ impl ExfatBitmap {
                 free_cluster_num += 1;
             }
         }
-        Ok(ExfatBitmap {
+        Ok(LearnedBitmap {
             chain,
             bitvec: BitVec::from_slice(&buf),
             dirty_bytes: VecDeque::new(),
@@ -83,7 +83,7 @@ impl ExfatBitmap {
         })
     }
 
-    fn fs(&self) -> Arc<ExfatFS> {
+    fn fs(&self) -> Arc<LearnedFS> {
         self.fs.upgrade().unwrap()
     }
 
