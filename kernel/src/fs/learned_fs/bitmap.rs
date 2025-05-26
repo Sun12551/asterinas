@@ -6,16 +6,14 @@
 use core::ops::Range;
 
 use align_ext::AlignExt;
-use aster_rights::Full;
 use bitvec::prelude::*;
 
 use super::{
     constants::EXFAT_RESERVED_CLUSTERS,
-    dentry::{ExfatBitmapDentry, ExfatDentry, ExfatDentryIterator},
-    fat::{ClusterID, ExfatChain},
+    fat::ClusterID,
     fs::LearnedFS,
 };
-use crate::{fs::learned_fs::fat::FatChainFlags, prelude::*, vm::vmo::Vmo};
+use crate::prelude::*;
 
 // TODO: use u64
 type BitStore = u8;
@@ -24,8 +22,8 @@ const BITS_PER_BYTE: usize = 8;
 
 #[derive(Debug, Default)]
 pub(super) struct LearnedBitmap {
-    // Start cluster of allocation bitmap.
-    chain: ExfatChain,
+    // Start offset of the bitmap
+    start_offset: usize,
     bitvec: BitVec<BitStore>,
     dirty_bytes: VecDeque<Range<usize>>,
 
@@ -37,37 +35,12 @@ pub(super) struct LearnedBitmap {
 impl LearnedBitmap {
     pub(super) fn load(
         fs_weak: Weak<LearnedFS>,
-        root_page_cache: Vmo<Full>,
-        root_chain: ExfatChain,
     ) -> Result<Self> {
-        let dentry_iterator = ExfatDentryIterator::new(root_page_cache, 0, None)?;
-
-        for dentry_result in dentry_iterator {
-            let dentry = dentry_result?;
-            if let ExfatDentry::Bitmap(bitmap_dentry) = dentry {
-                // If the last bit of bitmap is 0, it is a valid bitmap.
-                if (bitmap_dentry.flags & 0x1) == 0 {
-                    return Self::load_bitmap_from_dentry(fs_weak.clone(), &bitmap_dentry);
-                }
-            }
-        }
-
-        return_errno_with_message!(Errno::EINVAL, "bitmap not found")
-    }
-
-    fn load_bitmap_from_dentry(fs_weak: Weak<LearnedFS>, dentry: &ExfatBitmapDentry) -> Result<Self> {
         let fs = fs_weak.upgrade().unwrap();
-        let num_clusters = (dentry.size as usize).align_up(fs.cluster_size()) / fs.cluster_size();
-
-        let chain = ExfatChain::new(
-            fs_weak.clone(),
-            dentry.start_cluster,
-            Some(num_clusters as u32),
-            FatChainFlags::ALLOC_POSSIBLE,
-        )?;
-        let mut buf = vec![0; dentry.size as usize];
-
-        fs.read_meta_at(chain.physical_cluster_start_offset(), &mut buf)?;
+        let super_block = fs.super_block();
+        let mut buf = vec![0; super_block.num_bitmap_sectors as usize * super_block.sector_size as usize];
+        let start_offset = super_block.bitmap_start_sector as usize * super_block.sector_size as usize;
+        fs.read_meta_at(start_offset, &mut buf)?;
         let mut free_cluster_num = 0;
         for idx in 0..fs.super_block().num_clusters - EXFAT_RESERVED_CLUSTERS {
             if (buf[idx as usize / BITS_PER_BYTE] & (1 << (idx % BITS_PER_BYTE as u32))) == 0 {
@@ -75,7 +48,7 @@ impl LearnedBitmap {
             }
         }
         Ok(LearnedBitmap {
-            chain,
+            start_offset: start_offset,
             bitvec: BitVec::from_slice(&buf),
             dirty_bytes: VecDeque::new(),
             num_free_cluster: free_cluster_num,
@@ -362,9 +335,7 @@ impl LearnedBitmap {
         let bytes: &[BitStore] = self.bitvec.as_raw_slice();
         let byte_chunk = &bytes[start_byte_off..end_byte_off];
 
-        let pos = self.chain.walk_to_cluster_at_offset(start_byte_off)?;
-
-        let phys_offset = pos.0.physical_cluster_start_offset() + pos.1;
+        let phys_offset = self.start_offset + start_byte_off * unit_size;
         self.fs().write_meta_at(phys_offset, byte_chunk)?;
 
         let byte_range = phys_offset..phys_offset + byte_chunk.len();

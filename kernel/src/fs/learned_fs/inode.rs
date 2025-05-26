@@ -14,6 +14,8 @@ use aster_block::{
 };
 use aster_rights::Full;
 use ostd::mm::{Segment, VmIo};
+use alloc::collections::LinkedList;
+use hashbrown::HashMap;
 
 use super::{
     constants::*,
@@ -23,6 +25,8 @@ use super::{
     },
     fat::{ClusterAllocator, ClusterID, ExfatChainPosition, FatChainFlags},
     fs::{ExfatMountOptions, LEARNED_ROOT_INO},
+    model::Model,
+    segment::{DirEntry, LearnedSegment},
     utils::{make_hash_index, DosTimestamp},
 };
 use crate::{
@@ -42,6 +46,8 @@ use crate::{
 
 ///Inode number
 pub type Ino = u64;
+pub(super) const DELETE_FLAG: Ino = 0x8000_0000_0000_0000;
+pub(super) const INO_MASK: Ino = 0x7FFF_FFFF_FFFF_FFFF;
 
 bitflags! {
     pub struct FatAttr : u16{
@@ -133,6 +139,10 @@ struct LearnedInodeInner {
     /// Important: To enlarge the page_cache, we need to update the page_cache size before we update the size of inode, to avoid extra data read.
     /// To shrink the page_cache, we need to update the page_cache size after we update the size of inode, to avoid extra data write.
     page_cache: PageCache,
+
+    model: Model,
+    dentry_buffer: Option<HashMap<String, Ino>>,
+    segments: LinkedList<Arc<RwLock<LearnedSegment>>>,
 }
 
 impl PageCacheBackend for LearnedInode {
@@ -606,6 +616,157 @@ impl LearnedInodeInner {
         self.mtime = now;
         Ok(())
     }
+
+    fn merge_buffer(&mut self) -> Result<()> {
+        if !self.inode_type.is_directory() {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        if self.dentry_buffer.is_none() {
+            return Ok(());
+        }
+
+        let mut new_entries = self.dentry_buffer
+            .take()
+            .unwrap()
+            .drain()
+            .map(|(name, ino)| DirEntry {
+                name,
+                ino,
+            })
+            .collect::<Vec<_>>();
+        new_entries.sort_unstable();
+
+        let mut segment_cursor = self.segments.cursor_front_mut();
+        let mut process_idx = 0;
+        while let Some(_) = segment_cursor.current() {
+            let (first_entry, last_entry) = {
+                let segment = segment_cursor.current().unwrap();
+                (
+                    segment.read().dentries.first().unwrap().clone(),
+                    segment.read().dentries.last().unwrap().clone(),
+                )
+            };
+            // number of entries before the current segment
+            let mut before_cnt = new_entries[process_idx..].binary_search_by(
+                |entry| entry.cmp(&first_entry)
+            ).unwrap_or_else(|x| x);
+            
+            while before_cnt >= MIN_SEGMENT_SIZE {
+                let new_segment = Arc::new(RwLock::new(LearnedSegment::new(&new_entries[process_idx..process_idx + MIN_SEGMENT_SIZE])));
+                self.model.train(new_segment.clone())?;
+                segment_cursor.insert_before(new_segment);
+                process_idx += MIN_SEGMENT_SIZE;
+                before_cnt -= MIN_SEGMENT_SIZE;
+            }
+
+            // number of entries falls in the current segment (before_cnt is included)
+            let in_cnt = new_entries[process_idx..].binary_search_by(
+                |entry| entry.cmp(&last_entry)
+            ).unwrap_or_else(|x| x);
+            
+            // new entries falls in the middle of current segment and next segment
+            let after_cnt = if let Some(next_seg) = segment_cursor.peek_next() {
+                let binding = next_seg.read();
+                let next_first_entry = binding.dentries.first().unwrap();
+                let after = new_entries[process_idx..].binary_search_by(
+                    |entry| entry.cmp(&next_first_entry)
+                ).unwrap_or_else(|x| x) - in_cnt;
+                after % MIN_SEGMENT_SIZE
+            } else {
+                let after = new_entries.len() - process_idx - in_cnt;
+                after % MIN_SEGMENT_SIZE
+            };
+
+            if in_cnt + after_cnt > 0 {
+                // merge in_cnt+after_cnt entries into current segment
+                // Uninstall the current segment from cursor
+                let cur_segment = segment_cursor.remove_current().unwrap();
+                self.model.remove(cur_segment.clone())?;
+                // Merge current segment with new entries
+                if let Ok(cur_segment) = Arc::try_unwrap(cur_segment) {
+                    let new_segments = cur_segment.read().merge(&new_entries[process_idx..process_idx + in_cnt + after_cnt]);
+                    for new_segment in new_segments {
+                        self.model.train(new_segment.clone())?;
+                        segment_cursor.insert_before(new_segment);
+                    }
+                    process_idx += in_cnt + after_cnt;
+                } else {
+                    panic!("Failed to unwrap current segment, this should not happen");
+                }
+            } else {
+                segment_cursor.move_next();
+            }
+        }
+
+        while process_idx < new_entries.len() {
+            let new_segment = Arc::new(RwLock::new(LearnedSegment::new(&new_entries[process_idx..process_idx + MIN_SEGMENT_SIZE])));
+            self.model.train(new_segment.clone())?;
+            self.segments.push_back(new_segment);
+            process_idx += MIN_SEGMENT_SIZE;
+        }
+        
+        Ok(())
+    }
+
+    pub(super) fn add_entry(&mut self, name: &str, ino: Ino) -> Result<()> {
+        if !self.inode_type.is_directory() {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        if self.dentry_buffer.is_none() {
+            self.dentry_buffer = Some(HashMap::new());
+        }
+        
+        let dentry_buffer = self.dentry_buffer.as_mut().unwrap();
+        dentry_buffer.insert(name.to_string(), ino);
+        if dentry_buffer.len() >= MAX_BUFFER_SIZE {
+            self.merge_buffer()?;
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn lookup_entry(&self, name: &str) -> Result<Ino> {
+        if !self.inode_type.is_directory() {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        if let Some(dentry_buffer) = &self.dentry_buffer {
+            if let Some(ino) = dentry_buffer.get(name) {
+                return Ok(*ino);
+            }
+        }
+
+        let predicted = self.model.predict_position(name)?;
+        let binding = predicted.segment.read();
+        let dentry = binding.search(predicted.offset, name)?;
+        if dentry.is_deleted() {
+            return_errno!(Errno::ENOENT);
+        }
+        return Ok(dentry.ino());
+    }
+
+    pub(super) fn delete_entry(&mut self, name: &str) -> Result<Ino> {
+        if !self.inode_type.is_directory() {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        if let Some(dentry_buffer) = &mut self.dentry_buffer {
+            if let Some(ino) = dentry_buffer.remove(name) {
+                return Ok(ino);
+            }
+        }
+
+        let predicted = self.model.predict_position(name)?;
+        let mut binding = predicted.segment.write();
+        let dentry = binding.search_mut(predicted.offset, name)?;
+        if dentry.is_deleted() {
+            return_errno!(Errno::ENOENT);
+        }
+        dentry.mark_deleted();
+        Ok(dentry.ino())
+    }
 }
 
 impl LearnedInode {
@@ -666,6 +827,9 @@ impl LearnedInode {
                 parent_hash: 0,
                 fs: fs_weak,
                 page_cache: PageCache::with_capacity(size, weak_self.clone() as _).unwrap(),
+                model: Model::new(),
+                dentry_buffer: None,
+                segments: LinkedList::new(),
             }),
             extension: Extension::new(),
         });
@@ -776,6 +940,9 @@ impl LearnedInode {
                 parent_hash,
                 fs: fs_weak,
                 page_cache: PageCache::with_capacity(size, weak_self.clone() as _).unwrap(),
+                model: Model::new(),
+                dentry_buffer: None,
+                segments: LinkedList::new(),
             }),
             extension: Extension::new(),
         });

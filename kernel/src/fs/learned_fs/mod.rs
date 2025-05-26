@@ -6,6 +6,8 @@ mod dentry;
 mod fat;
 mod fs;
 mod inode;
+mod model;
+mod segment;
 mod super_block;
 mod utils;
 

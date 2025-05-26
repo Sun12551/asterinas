@@ -93,11 +93,7 @@ impl LearnedFS {
 
         let root = LearnedInode::build_root_inode(weak_fs.clone(), root_chain.clone())?;
 
-        let bitmap = LearnedBitmap::load(
-            weak_fs.clone(),
-            root.page_cache().unwrap(),
-            root_chain.clone(),
-        )?;
+        let bitmap = LearnedBitmap::load(weak_fs.clone())?;
 
         *exfat_fs.bitmap.lock() = bitmap;
 
@@ -268,9 +264,15 @@ impl LearnedFS {
             return_errno_with_message!(Errno::EINVAL, "bogus fat length");
         }
 
-        if super_block.data_start_sector
+        if super_block.bitmap_start_sector
             < super_block.fat1_start_sector
                 + (super_block.num_fat_sectors as u64 * boot_sector.num_fats as u64)
+        {
+            return_errno_with_message!(Errno::EINVAL, "bogus bitmap start vector");
+        }
+
+        if super_block.data_start_sector < super_block.bitmap_start_sector
+            + (super_block.num_bitmap_sectors as u64)
         {
             return_errno_with_message!(Errno::EINVAL, "bogus data start vector");
         }
