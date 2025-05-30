@@ -36,7 +36,7 @@ pub struct LearnedFS {
 
     bitmap: Arc<Mutex<LearnedBitmap>>,
 
-    mount_option: ExfatMountOptions,
+    mount_option: LearnedMountOptions,
     //Used for inode allocation.
     next_alloc_inode_number: AtomicU64,
 
@@ -58,7 +58,7 @@ pub(super) const LEARNED_ROOT_INO: Ino = 1;
 impl LearnedFS {
     pub fn open(
         block_device: Arc<dyn BlockDevice>,
-        mount_option: ExfatMountOptions,
+        mount_option: LearnedMountOptions,
     ) -> Result<Arc<Self>> {
         // Load the super_block
         let super_block = Self::read_super_block(block_device.as_ref())?;
@@ -349,7 +349,7 @@ impl LearnedFS {
         todo!();
     }
 
-    pub fn mount_option(&self) -> ExfatMountOptions {
+    pub fn mount_option(&self) -> LearnedMountOptions {
         self.mount_option.clone()
     }
 }
@@ -421,7 +421,7 @@ pub enum ExfatErrorMode {
 
 #[derive(Clone, Debug, Default)]
 //Mount options
-pub struct ExfatMountOptions {
+pub struct LearnedMountOptions {
     pub(super) fs_uid: usize,
     pub(super) fs_gid: usize,
     pub(super) fs_fmask: u16,

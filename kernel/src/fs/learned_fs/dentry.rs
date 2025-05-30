@@ -9,7 +9,7 @@ use super::{
     constants::{EXFAT_FILE_NAME_LEN, MAX_NAME_LENGTH},
     fat::FatChainFlags,
     fs::LearnedFS,
-    inode::FatAttr,
+    inode::LearnedAttr,
     utils::{calc_checksum_16, DosTimestamp},
 };
 use crate::{
@@ -223,7 +223,7 @@ impl ExfatDentrySet {
     ) -> Result<Self> {
         let attrs = {
             if inode_type == InodeType::Dir {
-                FatAttr::DIRECTORY.bits()
+                LearnedAttr::DIRECTORY.bits()
             } else {
                 0
             }

@@ -11,7 +11,7 @@ mod segment;
 mod super_block;
 mod utils;
 
-pub use fs::{LearnedFS, ExfatMountOptions};
+pub use fs::{LearnedFS, LearnedMountOptions};
 pub use inode::LearnedInode;
 
 #[cfg(ktest)]
@@ -32,7 +32,7 @@ mod test {
         fs::{
             exfat::{
                 constants::{EXFAT_RESERVED_CLUSTERS, MAX_NAME_LENGTH},
-                LearnedFS, ExfatMountOptions,
+                LearnedFS, LearnedMountOptions,
             },
             utils::{generate_random_operation, new_fs_in_memory, Inode, InodeMode, InodeType},
         },
@@ -126,7 +126,7 @@ mod test {
     fn load_exfat() -> Arc<LearnedFS> {
         let segment = new_vm_segment_from_image();
         let disk = ExfatMemoryDisk::new(segment);
-        let mount_option = ExfatMountOptions::default();
+        let mount_option = LearnedMountOptions::default();
         let fs = LearnedFS::open(Arc::new(disk), mount_option);
         assert!(fs.is_ok(), "Fs failed to init:{:?}", fs.unwrap_err());
         fs.unwrap()
