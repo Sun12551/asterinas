@@ -2,7 +2,6 @@
 
 mod bitmap;
 mod constants;
-mod dentry;
 mod fat;
 mod fs;
 mod inode;

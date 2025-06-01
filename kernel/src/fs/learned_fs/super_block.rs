@@ -33,6 +33,10 @@ pub struct LearnedSuperBlock {
     pub bitmap_start_sector: u64,
     /// number of bitmap sectors
     pub num_bitmap_sectors: u32,
+    /// inode start sector
+    pub inode_start_sector: u64,
+    /// number of inode sectors
+    pub num_inode_sectors: u32,
     /// root dir cluster
     pub root_dir: u32,
     /// number of dentries per cluster
@@ -67,6 +71,9 @@ impl TryFrom<LearnedBootSector> for LearnedSuperBlock {
 
             bitmap_start_sector: sector.bitmap_offset as u64,
             num_bitmap_sectors: sector.bitmap_length,
+            
+            inode_start_sector: sector.inode_offset as u64,
+            num_inode_sectors: sector.inode_length,
 
             data_start_sector: sector.cluster_offset as u64,
             num_sectors: sector.vol_length,
@@ -110,10 +117,11 @@ pub(super) struct LearnedBootSector {
     pub fat_length: u32, //FAT的长度，单位是sector
     pub bitmap_offset: u32, //bitmap的起始sector
     pub bitmap_length: u32, //bitmap的长度，单位是sector
+    pub inode_offset: u32, //inode的起始sector
+    pub inode_length: u32, //inode的长度，单位是sector
     pub cluster_offset: u32, //数据区的起始sector
     pub cluster_count: u32, //cluster的个数，不包括reserved cluster
     pub root_cluster: u32, //根目录的起始cluster
-    pub vol_serial: u32, //not used
     pub fs_revision: [u8; 2], //not used
     pub vol_flags: u16, //卷标的标志位
     pub sector_size_bits: u8, //描述sector的大小
@@ -121,7 +129,7 @@ pub(super) struct LearnedBootSector {
     pub num_fats: u8, // FAT的个数
     pub drv_sel: u8, //not used
     pub percent_in_use: u8, //not used
-    pub reserved: [u8; 7],
+    pub reserved: [u8; 3],
     pub boot_code: [u8; 382], //not used
     pub signature: u16, //文件系统的签名
 }

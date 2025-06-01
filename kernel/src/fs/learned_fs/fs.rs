@@ -16,12 +16,10 @@ use ostd::mm::Segment;
 pub(super) use ostd::mm::VmIo;
 
 use super::{
-    bitmap::LearnedBitmap,
-    fat::{ClusterID, ExfatChain, FatChainFlags, FatValue, FAT_ENTRY_SIZE},
-    inode::LearnedInode,
-    super_block::{LearnedBootSector, LearnedSuperBlock},
-    constants::*,
-    inode::Ino,
+    bitmap::LearnedBitmap, constants::*, 
+    fat::{ClusterID, ExfatChain, FatChainFlags, FatValue, FAT_ENTRY_SIZE}, 
+    inode::{Ino, LearnedInode, LearnedInodeOnDisk, LEARNED_INODE_ONDISK_SIZE}, 
+    super_block::{LearnedBootSector, LearnedSuperBlock}
 };
 
 use crate::{
@@ -147,6 +145,29 @@ impl LearnedFS {
 
     pub(super) fn read_meta_at(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
         self.meta_cache.pages().read_bytes(offset, buf)?;
+        Ok(())
+    }
+
+    pub(super) fn read_inode(&self, ino: Ino) -> Result<LearnedInodeOnDisk> {
+        let byte_start = self.super_block.inode_start_sector as usize * self.super_block.sector_size as usize
+            + (ino as usize) * LEARNED_INODE_ONDISK_SIZE;
+        let mut buf = [0u8; LEARNED_INODE_ONDISK_SIZE];
+        self.read_meta_at(byte_start, &mut buf)?;
+        Ok(LearnedInodeOnDisk::from_bytes(&buf))
+    }
+
+    pub(super) fn write_inode(
+        &self,
+        ino: Ino,
+        inode: &LearnedInodeOnDisk,
+        sync: bool,
+    ) -> Result<()> {
+        let byte_start = self.super_block.inode_start_sector as usize * self.super_block.sector_size as usize
+            + (ino as usize) * LEARNED_INODE_ONDISK_SIZE;
+        self.write_meta_at(byte_start, inode.as_bytes())?;
+        if sync {
+            self.sync_meta_at(byte_start..byte_start + LEARNED_INODE_ONDISK_SIZE)?;
+        }
         Ok(())
     }
 

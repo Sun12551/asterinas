@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-
+#![expect(dead_code)]
 use core::{ops::Range, time::Duration};
 
 use time::{OffsetDateTime, PrimitiveDateTime, Time};

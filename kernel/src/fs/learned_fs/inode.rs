@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![expect(dead_code)]
 #![expect(unused_variables)]
 
 use alloc::string::String;
@@ -19,20 +18,15 @@ use hashbrown::HashMap;
 
 use super::{
     constants::*,
-    dentry::{
-        Checksum, ExfatDentry, ExfatDentrySet, ExfatFileDentry, LearnedName, RawExfatDentry,
-        DENTRY_SIZE,
-    },
-    fat::{ClusterAllocator, ClusterID, ExfatChainPosition, FatChainFlags},
-    fs::{LearnedMountOptions, LEARNED_ROOT_INO},
+    fat::{ClusterAllocator, ClusterID, ExfatChainPosition, FatChainFlags, ExfatChain},
+    fs::{LEARNED_ROOT_INO, LearnedFS},
     model::Model,
-    segment::{DirEntry, LearnedSegment},
-    utils::{make_hash_index, DosTimestamp},
+    segment::{DirEntry, LearnedSegment, DentryAttr},
+    utils::DosTimestamp,
 };
 use crate::{
     events::IoEvents,
     fs::{
-        learned_fs::{dentry::ExfatDentryIterator, fat::ExfatChain, fs::LearnedFS},
         path::{is_dot, is_dot_or_dotdot, is_dotdot},
         utils::{
             CachePage, DirentVisitor, Extension, Inode, InodeMode, InodeType, IoctlCmd, Metadata,
@@ -46,47 +40,13 @@ use crate::{
 
 ///Inode number
 pub type Ino = u64;
-pub(super) const DELETE_FLAG: Ino = 0x8000_0000_0000_0000;
-pub(super) const INO_MASK: Ino = 0x7FFF_FFFF_FFFF_FFFF;
 
-bitflags! {
-    pub struct LearnedAttr : u16{
-        /// This inode is read only.
-        const READONLY  = 0x0001;
-        /// This inode is hidden. This attribute is not supported in our implementation.
-        const HIDDEN    = 0x0002;
-        /// This inode belongs to the OS. This attribute is not supported in our implementation.
-        const SYSTEM    = 0x0004;
-        /// This inode represents a volume. This attribute is not supported in our implementation.
-        const VOLUME    = 0x0008;
-        /// This inode represents a directory.
-        const DIRECTORY = 0x0010;
-        /// This file has been touched since the last DOS backup was performed on it. This attribute is not supported in our implementation.
-        const ARCHIVE   = 0x0020;
-    }
-}
-
-impl LearnedAttr {
-    /// Convert attribute bits and a mask to the UNIX mode.
-    fn make_mode(&self, mount_option: LearnedMountOptions, mode: InodeMode) -> InodeMode {
-        let mut ret = mode;
-        if self.contains(LearnedAttr::READONLY) && !self.contains(LearnedAttr::DIRECTORY) {
-            ret.remove(InodeMode::S_IWGRP | InodeMode::S_IWUSR | InodeMode::S_IWOTH);
-        }
-        if self.contains(LearnedAttr::DIRECTORY) {
-            ret.remove(InodeMode::from_bits_truncate(mount_option.fs_dmask));
-        } else {
-            ret.remove(InodeMode::from_bits_truncate(mount_option.fs_fmask));
-        }
-        ret
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
+#[repr(C, packed)]
+#[derive(Debug, Default, Clone, Copy, Pod)]
 pub(super) struct LearnedInodeOnDisk {
     pub(super) valid_size: u64,
     pub(super) start_cluster: u32,
-    pub(super) attribute: u16,
+    pub(super) reserved: u16,
     pub(super) create_time: u16,
     pub(super) create_date: u16,
     pub(super) modify_time: u16,
@@ -101,25 +61,16 @@ pub(super) struct LearnedInodeOnDisk {
     pub(super) flags: u8, // bit0: AllocationPossible (must be 1); bit1: NoFatChain (=1 <=> contiguous)
 }
 
-impl LearnedInodeOnDisk {
-    pub(super) fn from(fs: Arc<LearnedFS>,
-        inode_type: InodeType,
-        _mode: InodeMode,
-    ) -> Result<Self> {
-        let attrs = {
-            if inode_type == InodeType::Dir {
-                LearnedAttr::DIRECTORY.bits()
-            } else {
-                0
-            }
-        };
+pub(super) const LEARNED_INODE_ONDISK_SIZE: usize = 32;
 
+impl LearnedInodeOnDisk {
+    pub(super) fn new(fs: Arc<LearnedFS>) -> Result<Self> {
         let dos_time = DosTimestamp::now()?;
 
         Ok(Self {
             valid_size: 0,
             start_cluster: 0,
-            attribute: attrs,
+            reserved: 0,
             create_time: dos_time.time,
             create_date: dos_time.date,
             modify_time: dos_time.time,
@@ -156,7 +107,7 @@ struct LearnedInodeInner {
     /// Inode type, File or Dir.
     inode_type: InodeType,
 
-    attr: LearnedAttr,
+    attr: DentryAttr,
 
     /// Start position on disk, this is undefined if the allocated size is 0.
     start_chain: ExfatChain,
@@ -179,7 +130,7 @@ struct LearnedInodeInner {
     num_sub_dirs: u32,
 
     /// ExFAT uses UTF-16 encoding, rust use utf-8 for string processing.
-    name: LearnedName,
+    name: String,
 
     /// Flag for whether the inode is deleted.
     is_deleted: bool,
@@ -195,7 +146,7 @@ struct LearnedInodeInner {
     page_cache: PageCache,
 
     model: Model,
-    dentry_buffer: Option<HashMap<String, Ino>>,
+    dentry_buffer: Option<HashMap<String, (Ino, InodeType)>>,
     segments: LinkedList<Arc<RwLock<LearnedSegment>>>,
 }
 
@@ -243,8 +194,7 @@ impl PageCacheBackend for LearnedInode {
 
 impl LearnedInodeInner {
     /// The hash_value to index inode. This should be unique in the whole fs.
-    /// Currently use dentry set physical position as hash value except for root(0).
-    /// TODO: Why not use inode number as hash value?
+    /// Currently use inode number as the hash value.
     fn hash_index(&self) -> usize {
         return self.ino as usize;
     }
@@ -304,17 +254,19 @@ impl LearnedInodeInner {
         if !self.start_chain.is_current_cluster_valid() {
             return Ok((0, 0));
         }
+        // TODO: may need to init segment header
 
-        let iterator = ExfatDentryIterator::new(self.page_cache.pages().dup(), 0, Some(self.size))?;
         let mut sub_inodes = 0;
         let mut sub_dirs = 0;
-        for dentry_result in iterator {
-            let dentry = dentry_result?;
-            if let ExfatDentry::File(file) = dentry {
-                sub_inodes += 1;
-                if LearnedAttr::from_bits_truncate(file.attribute).contains(LearnedAttr::DIRECTORY) {
-                    sub_dirs += 1;
-                }
+        for segment in self.segments.iter() {
+            let segment_inner = segment.read();
+            if segment_inner.total_entry_count > 0 {
+                sub_inodes += segment_inner.valid_entry_count;
+                sub_dirs += segment_inner
+                    .dentries
+                    .iter()
+                    .filter(|dentry| dentry.attr.contains(DentryAttr::DIRECTORY))
+                    .count();
             }
         }
         Ok((sub_inodes, sub_dirs))
@@ -361,56 +313,34 @@ impl LearnedInodeInner {
             return Ok(());
         }
 
-        // If the inode or its parent is already unlinked, there is no need for updating it.
-        if self.is_deleted || !self.dentry_set_position.0.is_current_cluster_valid() {
+        // If the inode is deleted, we should not write it back.
+        if self.is_deleted {
             return Ok(());
         }
 
-        let parent = self.get_parent_inode().unwrap_or_else(|| unimplemented!());
-        let page_cache = parent.page_cache().unwrap();
-
-        // Need to read the latest dentry set from parent inode.
-
-        let mut dentry_set =
-            ExfatDentrySet::read_from(page_cache.dup(), self.dentry_entry as usize * DENTRY_SIZE)?;
-
-        let mut file_dentry = dentry_set.get_file_dentry();
-        let mut stream_dentry = dentry_set.get_stream_dentry();
-
-        file_dentry.attribute = self.attr.bits();
-
-        file_dentry.create_utc_offset = self.ctime.utc_offset;
-        file_dentry.create_date = self.ctime.date;
-        file_dentry.create_time = self.ctime.time;
-        file_dentry.create_time_cs = self.ctime.increment_10ms;
-
-        file_dentry.modify_utc_offset = self.mtime.utc_offset;
-        file_dentry.modify_date = self.mtime.date;
-        file_dentry.modify_time = self.mtime.time;
-        file_dentry.modify_time_cs = self.mtime.increment_10ms;
-
-        file_dentry.access_utc_offset = self.atime.utc_offset;
-        file_dentry.access_date = self.atime.date;
-        file_dentry.access_time = self.atime.time;
-
-        stream_dentry.valid_size = self.size as u64;
-        stream_dentry.size = self.size_allocated as u64;
-        stream_dentry.start_cluster = self.start_chain.cluster_id();
-        stream_dentry.flags = self.start_chain.flags().bits();
-
-        dentry_set.set_file_dentry(&file_dentry);
-        dentry_set.set_stream_dentry(&stream_dentry);
-        dentry_set.update_checksum();
-
-        //Update the page cache of parent inode.
-        let start_off = self.dentry_entry as usize * DENTRY_SIZE;
-        let bytes = dentry_set.to_le_bytes();
-
-        page_cache.write_bytes(start_off, &bytes)?;
-        if sync {
-            page_cache.decommit(start_off..start_off + bytes.len())?;
-        }
-
+        let raw_inode = LearnedInodeOnDisk {
+            valid_size: self.size as u64,
+            start_cluster: self.start_chain.cluster_id(),
+            reserved: 0,
+            create_time: self.ctime.time,
+            create_date: self.ctime.date,
+            modify_time: self.mtime.time,
+            modify_date: self.mtime.date,
+            access_time: self.atime.time,
+            access_date: self.atime.date,
+            create_time_cs: self.ctime.increment_10ms,
+            modify_time_cs: self.mtime.increment_10ms,
+            create_utc_offset: self.ctime.utc_offset,
+            modify_utc_offset: self.mtime.utc_offset,
+            access_utc_offset: self.atime.utc_offset,
+            flags: self.start_chain.flags().bits(),
+        };
+        let fs = self.fs();
+        fs.write_inode(
+            self.ino,
+            &raw_inode,
+            sync,
+        )?;
         Ok(())
     }
 
@@ -432,39 +362,32 @@ impl LearnedInodeInner {
             return Ok((offset, 0));
         }
 
-        let fs = self.fs();
-        let cluster_size = fs.cluster_size();
-
-        let mut iter = ExfatDentryIterator::new(self.page_cache.pages().dup(), offset, None)?;
-
-        let mut dir_read = 0;
-        let mut current_off = offset;
-
-        // We need to skip empty or deleted dentry.
-        while dir_read < dir_cnt {
-            let dentry_result = iter.next();
-
-            if dentry_result.is_none() {
-                return_errno_with_message!(Errno::ENOENT, "inode data not available")
+        let mut rest = dir_cnt;
+        let mut iter_start_offset_in_segment = offset;
+        let mut dentry_global_offset = 0;
+        for segment in self.segments.iter() {
+            let segment_inner = segment.read();
+            if iter_start_offset_in_segment >= segment_inner.total_entry_count {
+                iter_start_offset_in_segment -= segment_inner.total_entry_count;
+                dentry_global_offset += segment_inner.total_entry_count;
+                continue;
             }
-
-            let dentry = dentry_result.unwrap()?;
-
-            if let ExfatDentry::File(file) = dentry {
-                if let Ok(dentry_set_size) =
-                    self.visit_sub_inode(&file, &mut iter, current_off, visitor, fs_guard)
-                {
-                    current_off += dentry_set_size;
-                    dir_read += 1;
-                } else {
-                    return Ok((current_off, dir_read));
+            for i in iter_start_offset_in_segment..segment_inner.total_entry_count {
+                let dentry = &segment_inner.dentries[i];
+                if dentry.is_deleted() {
+                    dentry_global_offset += 1;
+                    continue;
                 }
-            } else {
-                current_off += DENTRY_SIZE;
+                self.visit_sub_inode(dentry.ino, dentry, dentry_global_offset, visitor, fs_guard)?;
+                dentry_global_offset += 1;
+                rest -= 1;
+                if rest == 0 {
+                    return Ok((dentry_global_offset, dir_cnt));
+                }
             }
+            iter_start_offset_in_segment = 0;
         }
-
-        Ok((current_off, dir_read))
+        Ok((dentry_global_offset, dir_cnt - rest))
     }
 
     /// Visit a sub-inode at offset. Return the dentry-set size of the sub-inode.
@@ -472,110 +395,48 @@ impl LearnedInodeInner {
     /// only used in "visit_sub_inodes"
     fn visit_sub_inode(
         &self,
-        file_dentry: &ExfatFileDentry,
-        iter: &mut ExfatDentryIterator,
+        ino: Ino,
+        dentry: &DirEntry,
         offset: usize,
         visitor: &mut dyn DirentVisitor,
         fs_guard: &MutexGuard<()>,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         if !self.inode_type.is_directory() {
             return_errno!(Errno::ENOTDIR)
         }
-        let fs = self.fs();
-        let cluster_size = fs.cluster_size();
 
-        let dentry_position = self.start_chain.walk_to_cluster_at_offset(offset)?;
-
-        if let Some(child_inode) = fs.find_opened_inode(make_hash_index(
-            dentry_position.0.cluster_id(),
-            dentry_position.1 as u32,
-        )) {
+        if let Some(child_inode) = self.fs().find_opened_inode(ino as usize) {
             // Inode already exists.
             let child_inner = child_inode.inner.read();
-
-            for i in 0..(child_inner.dentry_set_size / DENTRY_SIZE - 1) {
-                let dentry_result = iter.next();
-                if dentry_result.is_none() {
-                    return_errno_with_message!(Errno::ENOENT, "inode data not available")
-                }
-                dentry_result.unwrap()?;
-            }
             visitor.visit(
-                &child_inner.name.to_string(),
+                &dentry.name,
                 child_inner.ino,
                 child_inner.inode_type,
                 offset,
             )?;
-
-            Ok(child_inner.dentry_set_size)
+            
         } else {
             // Otherwise, create a new node and insert it to hash map.
-            let ino = fs.alloc_inode_number();
-            let child_inode = LearnedInode::read_from_iterator(
+            let fs = self.fs();
+            let raw_inode = fs.read_inode(ino)?;
+            let inode = LearnedInode::build_from_inode_on_disk(
                 fs.clone(),
-                offset / DENTRY_SIZE,
-                dentry_position,
-                file_dentry,
-                iter,
+                &raw_inode,
+                ino,
+                dentry,
                 self.hash_index(),
                 fs_guard,
             )?;
-            let _ = fs.insert_inode(child_inode.clone());
-            let child_inner = child_inode.inner.read();
-
+            let _ = fs.insert_inode(inode.clone());
+            let child_inner = inode.inner.read();
             visitor.visit(
-                &child_inner.name.to_string(),
+                &dentry.name,
                 ino,
                 child_inner.inode_type,
                 offset,
             )?;
-            Ok(child_inner.dentry_set_size)
         }
-    }
-
-    fn delete_associated_secondary_clusters(
-        &mut self,
-        dentry: &ExfatDentry,
-        fs_guard: &MutexGuard<()>,
-    ) -> Result<()> {
-        let fs = self.fs();
-        let cluster_size = fs.cluster_size();
-        match dentry {
-            ExfatDentry::VendorAlloc(inner) => {
-                if !fs.is_valid_cluster(inner.start_cluster) {
-                    return Ok(());
-                }
-                let num_to_free = (inner.size as usize / cluster_size) as u32;
-                ExfatChain::new(
-                    self.fs.clone(),
-                    inner.start_cluster,
-                    Some(num_to_free),
-                    FatChainFlags::ALLOC_POSSIBLE,
-                )?
-                .remove_clusters_from_tail(num_to_free, self.is_sync())?;
-            }
-            ExfatDentry::GenericSecondary(inner) => {
-                if !fs.is_valid_cluster(inner.start_cluster) {
-                    return Ok(());
-                }
-                let num_to_free = (inner.size as usize / cluster_size) as u32;
-                ExfatChain::new(
-                    self.fs.clone(),
-                    inner.start_cluster,
-                    Some(num_to_free),
-                    FatChainFlags::ALLOC_POSSIBLE,
-                )?
-                .remove_clusters_from_tail(num_to_free, self.is_sync())?;
-            }
-            _ => {}
-        };
-        Ok(())
-    }
-
-    fn free_all_clusters(&mut self, fs_guard: &MutexGuard<()>) -> Result<()> {
-        let num_clusters = self.num_clusters();
-        self.start_chain
-            .remove_clusters_from_tail(num_clusters, self.is_sync())
+        return Ok(());
     }
 
     fn sync_metadata(&self, fs_guard: &MutexGuard<()>) -> Result<()> {
@@ -629,10 +490,7 @@ impl LearnedInodeInner {
             .take()
             .unwrap()
             .drain()
-            .map(|(name, ino)| DirEntry {
-                name,
-                ino,
-            })
+            .map(|(name, (ino, _type))| DirEntry::new(name, ino, _type))
             .collect::<Vec<_>>();
         new_entries.sort_unstable();
 
@@ -652,7 +510,7 @@ impl LearnedInodeInner {
             ).unwrap_or_else(|x| x);
             
             while before_cnt >= MIN_SEGMENT_SIZE {
-                let new_segment = Arc::new(RwLock::new(LearnedSegment::new(&new_entries[process_idx..process_idx + MIN_SEGMENT_SIZE])));
+                let new_segment = LearnedSegment::new(&new_entries[process_idx..process_idx + MIN_SEGMENT_SIZE], self.fs.clone());
                 self.model.train(new_segment.clone())?;
                 segment_cursor.insert_before(new_segment);
                 process_idx += MIN_SEGMENT_SIZE;
@@ -699,7 +557,7 @@ impl LearnedInodeInner {
         }
 
         while process_idx < new_entries.len() {
-            let new_segment = Arc::new(RwLock::new(LearnedSegment::new(&new_entries[process_idx..process_idx + MIN_SEGMENT_SIZE])));
+            let new_segment = LearnedSegment::new(&new_entries[process_idx..process_idx + MIN_SEGMENT_SIZE], self.fs.clone());
             self.model.train(new_segment.clone())?;
             self.segments.push_back(new_segment);
             process_idx += MIN_SEGMENT_SIZE;
@@ -716,7 +574,7 @@ impl LearnedInodeInner {
         }
 
         if let Some(dentry_buffer) = &self.dentry_buffer {
-            if let Some(ino) = dentry_buffer.get(name) {
+            if let Some((ino, _type)) = dentry_buffer.get(name) {
                 return Ok(fs.find_opened_inode(*ino as usize).unwrap());
             }
         }
@@ -747,6 +605,7 @@ impl LearnedInode {
     }
 
     pub(super) fn is_deleted(&self) -> bool {
+        // TODO: used DELETE flag from dentryattr.
         self.inner.read().is_deleted
     }
 
@@ -758,7 +617,7 @@ impl LearnedInode {
 
         let dentry_set_size = 0;
 
-        let attr = LearnedAttr::DIRECTORY;
+        let attr = DentryAttr::DIRECTORY;
 
         let inode_type = InodeType::Dir;
 
@@ -766,7 +625,7 @@ impl LearnedInode {
 
         let size = root_chain.num_clusters() as usize * sb.cluster_size as usize;
 
-        let name = LearnedName::new();
+        let name = String::new();
 
         let inode = Arc::new_cyclic(|weak_self| LearnedInode {
             inner: RwMutex::new(LearnedInodeInner {
@@ -810,134 +669,17 @@ impl LearnedInode {
         Ok(inode.clone())
     }
 
-    // Only used in read_from_iterator
-    fn build_from_dentry_set(
-        fs: Arc<LearnedFS>,
-        dentry_set: &ExfatDentrySet,
-        dentry_set_position: ExfatChainPosition,
-        dentry_entry: u32,
-        parent_hash: usize,
-        fs_guard: &MutexGuard<()>,
-    ) -> Result<Arc<LearnedInode>> {
-        const EXFAT_MINIMUM_DENTRY: usize = 3;
-
-        let ino = fs.alloc_inode_number();
-
-        if dentry_set.len() < EXFAT_MINIMUM_DENTRY {
-            return_errno_with_message!(Errno::EINVAL, "invalid dentry length")
-        }
-
-        let dentry_set_size = dentry_set.len() * DENTRY_SIZE;
-
-        let fs_weak = Arc::downgrade(&fs);
-
-        let file = dentry_set.get_file_dentry();
-        let attr = LearnedAttr::from_bits_truncate(file.attribute);
-
-        let inode_type = if attr.contains(LearnedAttr::DIRECTORY) {
-            InodeType::Dir
-        } else {
-            InodeType::File
-        };
-
-        let ctime = DosTimestamp::new(
-            file.create_time,
-            file.create_date,
-            file.create_time_cs,
-            file.create_utc_offset,
-        )?;
-        let mtime = DosTimestamp::new(
-            file.modify_time,
-            file.modify_date,
-            file.modify_time_cs,
-            file.modify_utc_offset,
-        )?;
-        let atime = DosTimestamp::new(
-            file.access_time,
-            file.access_date,
-            0,
-            file.access_utc_offset,
-        )?;
-
-        let stream = dentry_set.get_stream_dentry();
-        let size = stream.valid_size as usize;
-        let size_allocated = stream.size as usize;
-
-        if attr.contains(LearnedAttr::DIRECTORY) && size != size_allocated {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "allocated_size and valid_size can only be different for files!"
-            )
-        }
-
-        let chain_flag = FatChainFlags::from_bits_truncate(stream.flags);
-        let start_cluster = stream.start_cluster;
-        let num_clusters = size_allocated.align_up(fs.cluster_size()) / fs.cluster_size();
-
-        let start_chain = ExfatChain::new(
-            fs_weak.clone(),
-            start_cluster,
-            Some(num_clusters as u32),
-            chain_flag,
-        )?;
-
-        let name = dentry_set.get_name()?;
-        let inode = Arc::new_cyclic(|weak_self| LearnedInode {
-            inner: RwMutex::new(LearnedInodeInner {
-                ino,
-                dentry_set_position,
-                dentry_set_size,
-                dentry_entry,
-                inode_type,
-                attr,
-                start_chain,
-                size,
-                size_allocated,
-                atime,
-                mtime,
-                ctime,
-                num_sub_inodes: 0,
-                num_sub_dirs: 0,
-                name,
-                is_deleted: false,
-                parent_hash,
-                fs: fs_weak,
-                page_cache: PageCache::with_capacity(size, weak_self.clone() as _).unwrap(),
-                model: Model::new(),
-                dentry_buffer: None,
-                segments: LinkedList::new(),
-            }),
-            extension: Extension::new(),
-        });
-
-        if matches!(inode_type, InodeType::Dir) {
-            let inner = inode.inner.upread();
-            let num_sub_inode_dir: (usize, usize) = inner.count_num_sub_inode_and_dir(fs_guard)?;
-
-            let mut inode_inner = inner.upgrade();
-
-            inode_inner.num_sub_inodes = num_sub_inode_dir.0 as u32;
-            inode_inner.num_sub_dirs = num_sub_inode_dir.1 as u32;
-        }
-
-        Ok(inode)
-    }
-
     fn build_from_inode_on_disk(
         fs: Arc<LearnedFS>,
         inode_on_disk: &LearnedInodeOnDisk,
-        name: &str,
+        ino: Ino,
+        dentry: &DirEntry,
         parent_hash: usize,
         fs_guard: &MutexGuard<()>,
     ) -> Result<Arc<Self>> {
-        let ino = fs.alloc_inode_number();
         let fs_weak = Arc::downgrade(&fs);
-        let attr = LearnedAttr::from_bits_truncate(inode_on_disk.attribute);
-        let inode_type = if attr.contains(LearnedAttr::DIRECTORY) {
-            InodeType::Dir
-        } else {
-            InodeType::File
-        };
+        let attr = dentry.attr;
+        let inode_type = attr.make_type();
 
         let ctime = DosTimestamp::new(
             inode_on_disk.create_time,
@@ -968,7 +710,7 @@ impl LearnedInode {
             Some(num_clusters as u32),
             chain_flag,
         )?;
-        let name = LearnedName::from_str(name)?;
+        let name = dentry.name.clone();
         let inode = Arc::new_cyclic(|weak_self| LearnedInode {
             inner: RwMutex::new(LearnedInodeInner {
                 ino,
@@ -996,29 +738,18 @@ impl LearnedInode {
             }),
             extension: Extension::new(),
         });
-        Ok(inode)
-    }
 
-    /// The caller of the function should give a unique ino to assign to the inode.
-    /// Only used in visit_sub_inode
-    pub(super) fn read_from_iterator(
-        fs: Arc<LearnedFS>,
-        dentry_entry: usize,
-        chain_pos: ExfatChainPosition,
-        file_dentry: &ExfatFileDentry,
-        iter: &mut ExfatDentryIterator,
-        parent_hash: usize,
-        fs_guard: &MutexGuard<()>,
-    ) -> Result<Arc<Self>> {
-        let dentry_set = ExfatDentrySet::read_from_iterator(file_dentry, iter)?;
-        Self::build_from_dentry_set(
-            fs,
-            &dentry_set,
-            chain_pos,
-            dentry_entry as u32,
-            parent_hash,
-            fs_guard,
-        )
+        if matches!(inode_type, InodeType::Dir) {
+            let inner = inode.inner.upread();
+            let num_sub_inode_dir: (usize, usize) = inner.count_num_sub_inode_and_dir(fs_guard)?;
+
+            let mut inode_inner = inner.upgrade();
+
+            inode_inner.num_sub_inodes = num_sub_inode_dir.0 as u32;
+            inode_inner.num_sub_dirs = num_sub_inode_dir.1 as u32;
+        }
+
+        Ok(inode)
     }
 
     /// Add new dentries. Create a new file or folder.
@@ -1035,12 +766,18 @@ impl LearnedInode {
 
         let fs = self.inner.read().fs();
 
-        let raw_inode = LearnedInodeOnDisk::from(fs.clone(), inode_type, mode)?;
-
+        let raw_inode = LearnedInodeOnDisk::new(fs.clone())?;
+        let temp_dentry = DirEntry::new(
+            name.to_string(),
+            0, // inode number will be assigned later
+            inode_type,
+        );
+        let ino = fs.alloc_inode_number();
         let inode = Self::build_from_inode_on_disk(
             fs.clone(),
             &raw_inode,
-            name,
+            ino,
+            &temp_dentry,
             self.hash_index(),
             fs_guard,
         )?;
@@ -1057,7 +794,7 @@ impl LearnedInode {
 
         let dentry_buffer = inner.dentry_buffer.as_mut().unwrap();
         let ino = inode.ino();
-        dentry_buffer.insert(name.to_string(), ino);
+        dentry_buffer.insert(name.to_string(), (ino, inode_type));
 
 
         if dentry_buffer.len() >= MAX_BUFFER_SIZE {
@@ -1094,15 +831,14 @@ impl LearnedInode {
         }
         let new_parent_hash = self.hash_index();
         let sub_dir = inner.num_sub_inodes;
-        let mut child_offsets: Vec<usize> = vec![];
-        inner.visit_sub_inodes(0, sub_dir as usize, &mut child_offsets, fs_guard)?;
+        let mut child_inodes = InoVisitor {
+            inodes: vec![],
+        };
+        inner.visit_sub_inodes(0, sub_dir as usize, &mut child_inodes, fs_guard)?;
 
         let start_chain = inner.start_chain.clone();
-        for offset in child_offsets {
-            let child_dentry_pos = start_chain.walk_to_cluster_at_offset(offset)?;
-            let child_hash =
-                make_hash_index(child_dentry_pos.0.cluster_id(), child_dentry_pos.1 as u32);
-            let child_inode = inner.fs().find_opened_inode(child_hash).unwrap();
+        for ino in child_inodes.inodes {
+            let child_inode = inner.fs().find_opened_inode(ino as usize).unwrap();
             child_inode.inner.write().parent_hash = new_parent_hash;
         }
         Ok(())
@@ -1150,6 +886,15 @@ impl LearnedInode {
 struct EmptyVisitor;
 impl DirentVisitor for EmptyVisitor {
     fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
+        Ok(())
+    }
+}
+struct InoVisitor {
+    inodes: Vec<Ino>,
+}
+impl DirentVisitor for InoVisitor {
+    fn visit(&mut self, _name: &str, ino: u64, _type_: InodeType, _offset: usize) -> Result<()> {
+        self.inodes.push(ino);
         Ok(())
     }
 }

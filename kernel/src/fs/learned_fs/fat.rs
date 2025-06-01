@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-
+#![expect(dead_code)]
 use core::mem::size_of;
 
 use super::{
@@ -7,7 +7,16 @@ use super::{
     constants::{EXFAT_FIRST_CLUSTER, EXFAT_RESERVED_CLUSTERS},
     fs::LearnedFS,
 };
-use crate::prelude::*;
+use aster_block::{
+    bio::{BioWaiter, BioSegment, BioDirection},
+    id::BlockId,
+};
+use ostd::mm::Segment;
+use align_ext::AlignExt;
+use crate::{
+    prelude::*,
+    fs::utils::{PageCacheBackend, CachePage},
+};
 
 pub type ClusterID = u32;
 pub(super) const FAT_ENTRY_SIZE: usize = size_of::<ClusterID>();
@@ -66,6 +75,49 @@ pub struct ExfatChain {
     fs: Weak<LearnedFS>,
 }
 
+impl PageCacheBackend for ExfatChain {
+    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        if self.size() < idx * PAGE_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "Invalid read size")
+        }
+        let sector_size = self.fs().sector_size();
+        let sector_id = self.get_sector_id(idx * PAGE_SIZE / sector_size)?;
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::FromDevice,
+        );
+        let waiter = self.fs().block_device().read_blocks_async(
+            BlockId::from_offset(sector_id * sector_size),
+            bio_segment,
+        )?;
+        Ok(waiter)
+    }
+
+    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        if self.size() < idx * PAGE_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "Invalid write size")
+        }
+        let sector_size = self.fs().sector_size();
+        let sector_id = self.get_sector_id(idx * PAGE_SIZE / sector_size)?;
+
+        // FIXME: We may need to truncate the file if write_page fails.
+        // To fix this issue, we need to change the interface of the PageCacheBackend trait.
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::ToDevice,
+        );
+        let waiter = self.fs().block_device().write_blocks_async(
+            BlockId::from_offset(sector_id * sector_size),
+            bio_segment,
+        )?;
+        Ok(waiter)
+    }
+
+    fn npages(&self) -> usize {
+        self.size().align_up(PAGE_SIZE) / PAGE_SIZE
+    }
+}
+
 // A position by the chain and relative offset in the cluster.
 pub type ExfatChainPosition = (ExfatChain, usize);
 
@@ -104,6 +156,10 @@ impl ExfatChain {
         self.num_clusters
     }
 
+    pub(super) fn size(&self) -> usize {
+        self.num_clusters() as usize * self.cluster_size()
+    }
+
     pub(super) fn cluster_id(&self) -> ClusterID {
         self.current
     }
@@ -122,6 +178,14 @@ impl ExfatChain {
 
     fn fs(&self) -> Arc<LearnedFS> {
         self.fs.upgrade().unwrap()
+    }
+
+    fn get_sector_id(&self, sector_id: usize) -> Result<usize> {
+        let sect_per_cluster = self.fs().super_block().sect_per_cluster;
+        let cluster = self.walk(sector_id as u32 / sect_per_cluster)?.cluster_id();
+
+        let sec_offset = sector_id % sect_per_cluster as usize;
+        Ok(self.fs().cluster_to_off(cluster) / self.fs().sector_size() + sec_offset)
     }
 
     pub(super) fn physical_cluster_start_offset(&self) -> usize {

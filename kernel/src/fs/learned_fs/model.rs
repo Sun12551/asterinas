@@ -64,18 +64,20 @@ impl Model {
                 slope,
             })
         };
-        let add_spline_key = |key: &ModelKey, pos: Arc<ModelPosition>| {
-            let mut locked = self.0.lock();
-            locked.store(key.0, pos);
+        let mut spline_index = vec![];
+        let mut locked_model = self.0.lock();
+        let mut add_spline_key = |key: &ModelKey, pos: Arc<ModelPosition>| {
+            spline_index.push(pos.offset);
+            locked_model.store(key.0, pos);
         };
         let mut last_spline_key = ModelKey(0);
         let mut last_spline_offset = 0;
         let mut last_key = ModelKey(0);
         let mut last_offset = 0;
-        let mut offset: SegmentOffset = 0;
         let mut slope_upper_bound = Slope::MAX;
         let mut slope_lower_bound = Slope::MIN;
-        for entry in segment.read().dentries.iter() {
+        let segment_rd = segment.read();
+        for (offset, entry) in segment_rd.dentries.iter().enumerate() {
             let key = ModelKey::from_name(&entry.name);
             if offset == 0 {
                 // Insert the first key into the model, the slope doesn't matter
@@ -85,7 +87,7 @@ impl Model {
                 slope_upper_bound = Slope::MAX;
                 slope_lower_bound = Slope::MIN;
             }
-            else if offset == segment.read().dentries.len() - 1 {
+            else if offset == segment_rd.dentries.len() - 1 {
                 // Insert the last key into the model, the slope is calculated based on the last spline key
                 let cur_slope = Self::calculate_slope(&last_spline_key, &key, last_spline_offset, offset);
                 add_spline_key(&key, make_model_position(offset, cur_slope));
@@ -105,18 +107,17 @@ impl Model {
                 else {
                     // Update the slope bounds
                     let temp_upper_slope = Self::calculate_slope(&last_spline_key, &key, last_spline_offset, offset + MAX_MODEL_ERROR as SegmentOffset);
-                    if temp_upper_slope < slope_upper_bound {
-                        slope_upper_bound = temp_upper_slope;
-                    }
+                    slope_upper_bound = temp_upper_slope.min(slope_upper_bound);
                     let temp_lower_slope = Self::calculate_slope(&last_spline_key, &key, last_spline_offset, offset - MAX_MODEL_ERROR as SegmentOffset);
-                    if temp_lower_slope > slope_lower_bound {
-                        slope_lower_bound = temp_lower_slope;
-                    }
+                    slope_lower_bound = temp_lower_slope.max(slope_lower_bound);
                 }
             }
             last_key = key;
             last_offset = offset;
-            offset += 1;
+        }
+        let mut segment_wr = segment.write();
+        for ofs in spline_index {
+            segment_wr.dentries[ofs].mark_spline();
         }
         Ok(())
     }
