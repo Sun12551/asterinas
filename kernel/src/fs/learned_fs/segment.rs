@@ -52,6 +52,10 @@ impl DentryAttr {
             InodeType::File
         }
     }
+
+    pub(super) fn is_directory(&self) -> bool {
+        self.contains(DentryAttr::DIRECTORY)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

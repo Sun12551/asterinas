@@ -180,7 +180,7 @@ impl ExfatChain {
         self.fs.upgrade().unwrap()
     }
 
-    fn get_sector_id(&self, sector_id: usize) -> Result<usize> {
+    pub(super) fn get_sector_id(&self, sector_id: usize) -> Result<usize> {
         let sect_per_cluster = self.fs().super_block().sect_per_cluster;
         let cluster = self.walk(sector_id as u32 / sect_per_cluster)?.cluster_id();
 

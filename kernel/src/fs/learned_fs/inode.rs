@@ -18,7 +18,7 @@ use hashbrown::HashMap;
 
 use super::{
     constants::*,
-    fat::{ClusterAllocator, ClusterID, ExfatChainPosition, FatChainFlags, ExfatChain},
+    fat::{ClusterAllocator, ExfatChainPosition, FatChainFlags, ExfatChain},
     fs::{LEARNED_ROOT_INO, LearnedFS},
     model::Model,
     segment::{DirEntry, LearnedSegment, DentryAttr},
@@ -45,8 +45,8 @@ pub type Ino = u64;
 #[derive(Debug, Default, Clone, Copy, Pod)]
 pub(super) struct LearnedInodeOnDisk {
     pub(super) valid_size: u64,
+    pub(super) size: u64,
     pub(super) start_cluster: u32,
-    pub(super) reserved: u16,
     pub(super) create_time: u16,
     pub(super) create_date: u16,
     pub(super) modify_time: u16,
@@ -59,6 +59,7 @@ pub(super) struct LearnedInodeOnDisk {
     pub(super) modify_utc_offset: u8,
     pub(super) access_utc_offset: u8,
     pub(super) flags: u8, // bit0: AllocationPossible (must be 1); bit1: NoFatChain (=1 <=> contiguous)
+    pub(super) reserved: [u8; 26],
 }
 
 pub(super) const LEARNED_INODE_ONDISK_SIZE: usize = 32;
@@ -69,8 +70,8 @@ impl LearnedInodeOnDisk {
 
         Ok(Self {
             valid_size: 0,
+            size: 0,
             start_cluster: 0,
-            reserved: 0,
             create_time: dos_time.time,
             create_date: dos_time.date,
             modify_time: dos_time.time,
@@ -83,6 +84,7 @@ impl LearnedInodeOnDisk {
             modify_utc_offset: dos_time.utc_offset,
             access_utc_offset: dos_time.utc_offset,
             flags: FatChainFlags::FAT_CHAIN_NOT_IN_USE.bits(),
+            reserved: [0; 26],
         })
     }
 }
@@ -98,12 +100,8 @@ struct LearnedInodeInner {
     /// Inode number.
     ino: Ino,
 
-    /// Dentry set position in its parent directory.
+    /// Dentry set position in its parent directory. no use?
     dentry_set_position: ExfatChainPosition,
-    /// Dentry set size in bytes.
-    dentry_set_size: usize,
-    /// The entry number of the dentry.
-    dentry_entry: u32,
     /// Inode type, File or Dir.
     inode_type: InodeType,
 
@@ -156,7 +154,7 @@ impl PageCacheBackend for LearnedInode {
         if inner.size < idx * PAGE_SIZE {
             return_errno_with_message!(Errno::EINVAL, "Invalid read size")
         }
-        let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
+        let sector_id = inner.start_chain.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
         let bio_segment = BioSegment::new_from_segment(
             Segment::from(frame.clone()).into(),
             BioDirection::FromDevice,
@@ -170,9 +168,8 @@ impl PageCacheBackend for LearnedInode {
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
-        let sector_size = inner.fs().sector_size();
 
-        let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
+        let sector_id = inner.start_chain.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
 
         // FIXME: We may need to truncate the file if write_page fails.
         // To fix this issue, we need to change the interface of the PageCacheBackend trait.
@@ -204,26 +201,6 @@ impl LearnedInodeInner {
         self.fs().find_opened_inode(self.parent_hash)
     }
 
-    /// Get physical sector id from logical sector id for this Inode.
-    fn get_sector_id(&self, sector_id: usize) -> Result<usize> {
-        let chain_offset = self
-            .start_chain
-            .walk_to_cluster_at_offset(sector_id * self.fs().sector_size())?;
-
-        let sect_per_cluster = self.fs().super_block().sect_per_cluster as usize;
-        let cluster_id = sector_id / sect_per_cluster;
-        let cluster = self.get_physical_cluster((sector_id / sect_per_cluster) as ClusterID)?;
-
-        let sec_offset = sector_id % (self.fs().super_block().sect_per_cluster as usize);
-        Ok(self.fs().cluster_to_off(cluster) / self.fs().sector_size() + sec_offset)
-    }
-
-    /// Get the physical cluster id from the logical cluster id in the inode.
-    fn get_physical_cluster(&self, logical: ClusterID) -> Result<ClusterID> {
-        let chain = self.start_chain.walk(logical)?;
-        Ok(chain.cluster_id())
-    }
-
     /// The number of clusters allocated.
     fn num_clusters(&self) -> u32 {
         self.start_chain.num_clusters()
@@ -250,6 +227,8 @@ impl LearnedInodeInner {
             .make_mode(self.fs().mount_option(), InodeMode::all())
     }
 
+    /// Count the number of sub inodes and directories in this inode.
+    /// Only call for directory inode.
     fn count_num_sub_inode_and_dir(&self, fs_guard: &MutexGuard<()>) -> Result<(usize, usize)> {
         if !self.start_chain.is_current_cluster_valid() {
             return Ok((0, 0));
@@ -320,8 +299,8 @@ impl LearnedInodeInner {
 
         let raw_inode = LearnedInodeOnDisk {
             valid_size: self.size as u64,
+            size: self.size_allocated as u64,
             start_cluster: self.start_chain.cluster_id(),
-            reserved: 0,
             create_time: self.ctime.time,
             create_date: self.ctime.date,
             modify_time: self.mtime.time,
@@ -334,6 +313,7 @@ impl LearnedInodeInner {
             modify_utc_offset: self.mtime.utc_offset,
             access_utc_offset: self.atime.utc_offset,
             flags: self.start_chain.flags().bits(),
+            reserved: [0; 26],
         };
         let fs = self.fs();
         fs.write_inode(
@@ -378,7 +358,7 @@ impl LearnedInodeInner {
                     dentry_global_offset += 1;
                     continue;
                 }
-                self.visit_sub_inode(dentry.ino, dentry, dentry_global_offset, visitor, fs_guard)?;
+                self.visit_sub_inode(dentry, dentry_global_offset, visitor, fs_guard)?;
                 dentry_global_offset += 1;
                 rest -= 1;
                 if rest == 0 {
@@ -395,7 +375,6 @@ impl LearnedInodeInner {
     /// only used in "visit_sub_inodes"
     fn visit_sub_inode(
         &self,
-        ino: Ino,
         dentry: &DirEntry,
         offset: usize,
         visitor: &mut dyn DirentVisitor,
@@ -405,6 +384,7 @@ impl LearnedInodeInner {
             return_errno!(Errno::ENOTDIR)
         }
 
+        let ino = dentry.ino();
         if let Some(child_inode) = self.fs().find_opened_inode(ino as usize) {
             // Inode already exists.
             let child_inner = child_inode.inner.read();
@@ -422,7 +402,6 @@ impl LearnedInodeInner {
             let inode = LearnedInode::build_from_inode_on_disk(
                 fs.clone(),
                 &raw_inode,
-                ino,
                 dentry,
                 self.hash_index(),
                 fs_guard,
@@ -615,8 +594,6 @@ impl LearnedInode {
     ) -> Result<Arc<LearnedInode>> {
         let sb = fs_weak.upgrade().unwrap().super_block();
 
-        let dentry_set_size = 0;
-
         let attr = DentryAttr::DIRECTORY;
 
         let inode_type = InodeType::Dir;
@@ -631,8 +608,6 @@ impl LearnedInode {
             inner: RwMutex::new(LearnedInodeInner {
                 ino: LEARNED_ROOT_INO,
                 dentry_set_position: ExfatChainPosition::default(),
-                dentry_set_size: 0,
-                dentry_entry: 0,
                 inode_type,
                 attr,
                 start_chain: root_chain,
@@ -672,12 +647,12 @@ impl LearnedInode {
     fn build_from_inode_on_disk(
         fs: Arc<LearnedFS>,
         inode_on_disk: &LearnedInodeOnDisk,
-        ino: Ino,
         dentry: &DirEntry,
         parent_hash: usize,
         fs_guard: &MutexGuard<()>,
     ) -> Result<Arc<Self>> {
         let fs_weak = Arc::downgrade(&fs);
+        let ino = dentry.ino();
         let attr = dentry.attr;
         let inode_type = attr.make_type();
 
@@ -701,9 +676,17 @@ impl LearnedInode {
         )?;
 
         let size = inode_on_disk.valid_size as usize;
+        let size_allocated = inode_on_disk.size as usize;
+        if attr.is_directory() && size != size_allocated {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "allocated_size and valid_size can only be different for files!"
+            )
+        }
+
         let chain_flag = FatChainFlags::from_bits_truncate(inode_on_disk.flags);
         let start_cluster = inode_on_disk.start_cluster;
-        let num_clusters = size.align_up(fs.cluster_size()) / fs.cluster_size();
+        let num_clusters = size_allocated.align_up(fs.cluster_size()) / fs.cluster_size();
         let start_chain = ExfatChain::new(
             fs_weak.clone(),
             start_cluster,
@@ -715,13 +698,11 @@ impl LearnedInode {
             inner: RwMutex::new(LearnedInodeInner {
                 ino,
                 dentry_set_position: ExfatChainPosition::default(),
-                dentry_set_size: 0,
-                dentry_entry: 0,
                 inode_type,
                 attr,
                 start_chain,
                 size,
-                size_allocated: size,
+                size_allocated,
                 atime,
                 mtime,
                 ctime,
@@ -776,7 +757,6 @@ impl LearnedInode {
         let inode = Self::build_from_inode_on_disk(
             fs.clone(),
             &raw_inode,
-            ino,
             &temp_dentry,
             self.hash_index(),
             fs_guard,
@@ -813,8 +793,6 @@ impl LearnedInode {
         let other_inner = inode.inner.read();
 
         self_inner.dentry_set_position = other_inner.dentry_set_position.clone();
-        self_inner.dentry_set_size = other_inner.dentry_set_size;
-        self_inner.dentry_entry = other_inner.dentry_entry;
         self_inner.atime = other_inner.atime;
         self_inner.ctime = other_inner.ctime;
         self_inner.mtime = other_inner.mtime;
@@ -1454,7 +1432,6 @@ impl Inode for LearnedInode {
             .inner
             .read()
             .lookup_entry(old_name, &fs_guard)?;
-        // FIXME: Users may be confused, since inode with the same upper case name will be removed.
         let lookup_exist_result = target_
             .inner
             .read()
