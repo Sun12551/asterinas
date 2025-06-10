@@ -43,7 +43,7 @@ const DAY_RANGE: Range<usize> = 0..5;
 const MONTH_RANGE: Range<usize> = 5..9;
 const YEAR_RANGE: Range<usize> = 9..16;
 
-const EXFAT_TIME_ZONE_VALID: u8 = 1 << 7;
+const LEARNED_TIME_ZONE_VALID: u8 = 1 << 7;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DosTimestamp {
@@ -151,8 +151,8 @@ impl DosTimestamp {
         }
 
         /* Adjust timezone to UTC0. */
-        if (self.utc_offset & EXFAT_TIME_ZONE_VALID) != 0u8 {
-            sec = Self::adjust_time_zone(sec, self.utc_offset & (!EXFAT_TIME_ZONE_VALID));
+        if (self.utc_offset & LEARNED_TIME_ZONE_VALID) != 0u8 {
+            sec = Self::adjust_time_zone(sec, self.utc_offset & (!LEARNED_TIME_ZONE_VALID));
         } else {
             // TODO: Use mount info for timezone adjustment.
         }

@@ -61,7 +61,7 @@ impl LearnedFS {
         // Load the super_block
         let super_block = Self::read_super_block(block_device.as_ref())?;
         let fs_size = super_block.num_clusters as usize * super_block.cluster_size as usize;
-        let exfat_fs = Arc::new_cyclic(|weak_self| LearnedFS {
+        let learned_fs = Arc::new_cyclic(|weak_self| LearnedFS {
             block_device,
             super_block,
             bitmap: Arc::new(Mutex::new(LearnedBitmap::default())),
@@ -78,9 +78,9 @@ impl LearnedFS {
         // TODO: if the main superblock is corrupted, should we load the backup?
 
         // Verify boot region
-        Self::verify_boot_region(exfat_fs.block_device())?;
+        Self::verify_boot_region(learned_fs.block_device())?;
 
-        let weak_fs = Arc::downgrade(&exfat_fs);
+        let weak_fs = Arc::downgrade(&learned_fs);
 
         let root_chain = ExfatChain::new(
             weak_fs.clone(),
@@ -93,15 +93,15 @@ impl LearnedFS {
 
         let bitmap = LearnedBitmap::load(weak_fs.clone())?;
 
-        *exfat_fs.bitmap.lock() = bitmap;
+        *learned_fs.bitmap.lock() = bitmap;
 
         // TODO: Handle UTF-8
 
         // TODO: Init NLS Table
 
-        exfat_fs.inodes.write().insert(root.hash_index(), root);
+        learned_fs.inodes.write().insert(root.hash_index(), root);
 
-        Ok(exfat_fs)
+        Ok(learned_fs)
     }
 
     pub(super) fn alloc_inode_number(&self) -> Ino {
@@ -266,8 +266,8 @@ impl LearnedFS {
         }
 
         // sect_size_bits could be at least 9 and at most 12.
-        if boot_sector.sector_size_bits < EXFAT_MIN_SECT_SIZE_BITS
-            || boot_sector.sector_size_bits > EXFAT_MAX_SECT_SIZE_BITS
+        if boot_sector.sector_size_bits < LEARNED_MIN_SECT_SIZE_BITS
+            || boot_sector.sector_size_bits > LEARNED_MAX_SECT_SIZE_BITS
         {
             return_errno_with_message!(Errno::EINVAL, "bogus sector size bits");
         }
@@ -353,17 +353,17 @@ impl LearnedFS {
     }
 
     pub(super) fn cluster_to_off(&self, cluster: u32) -> usize {
-        (((((cluster - EXFAT_RESERVED_CLUSTERS) as u64) << self.super_block.sect_per_cluster_bits)
+        (((((cluster - LEARNED_RESERVED_CLUSTERS) as u64) << self.super_block.sect_per_cluster_bits)
             + self.super_block.data_start_sector)
             * self.super_block.sector_size as u64) as usize
     }
 
     pub(super) fn is_valid_cluster(&self, cluster: u32) -> bool {
-        cluster >= EXFAT_RESERVED_CLUSTERS && cluster < self.super_block.num_clusters
+        cluster >= LEARNED_RESERVED_CLUSTERS && cluster < self.super_block.num_clusters
     }
 
     pub(super) fn is_cluster_range_valid(&self, clusters: Range<ClusterID>) -> bool {
-        clusters.start >= EXFAT_RESERVED_CLUSTERS && clusters.end <= self.super_block.num_clusters
+        clusters.start >= LEARNED_RESERVED_CLUSTERS && clusters.end <= self.super_block.num_clusters
     }
 
     pub(super) fn set_volume_dirty(&mut self) {
@@ -433,7 +433,7 @@ impl FileSystem for LearnedFS {
 
 #[derive(Clone, Debug, Default)]
 // Error handling
-pub enum ExfatErrorMode {
+pub enum LearnedErrorMode {
     #[default]
     Continue,
     Panic,
@@ -449,7 +449,7 @@ pub struct LearnedMountOptions {
     pub(super) fs_dmask: u16,
     pub(super) allow_utime: u16,
     pub(super) iocharset: String,
-    pub(super) errors: ExfatErrorMode,
+    pub(super) errors: LearnedErrorMode,
     pub(super) utf8: bool,
     pub(super) sys_tz: bool,
     pub(super) discard: bool,

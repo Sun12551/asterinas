@@ -2,7 +2,7 @@
 
 use ostd::Pod;
 
-use super::constants::{EXFAT_FIRST_CLUSTER, EXFAT_RESERVED_CLUSTERS, MEDIA_FAILURE, VOLUME_DIRTY};
+use super::constants::{LEARNED_FIRST_CLUSTER, LEARNED_RESERVED_CLUSTERS, MEDIA_FAILURE, VOLUME_DIRTY};
 use crate::prelude::*;
 
 #[repr(C, packed)]
@@ -56,7 +56,7 @@ const DENTRY_SIZE_BITS: u32 = 5;
 impl TryFrom<LearnedBootSector> for LearnedSuperBlock {
     type Error = crate::error::Error;
     fn try_from(sector: LearnedBootSector) -> Result<LearnedSuperBlock> {
-        const EXFAT_CLUSTERS_UNTRACKED: u32 = !0;
+        const LEARNED_CLUSTERS_UNTRACKED: u32 = !0;
         let mut block = LearnedSuperBlock {
             sect_per_cluster_bits: sector.sector_per_cluster_bits as u32,
             sect_per_cluster: 1 << sector.sector_per_cluster_bits as u32,
@@ -77,16 +77,16 @@ impl TryFrom<LearnedBootSector> for LearnedSuperBlock {
 
             data_start_sector: sector.cluster_offset as u64,
             num_sectors: sector.vol_length,
-            num_clusters: sector.cluster_count + EXFAT_RESERVED_CLUSTERS,
+            num_clusters: sector.cluster_count + LEARNED_RESERVED_CLUSTERS,
 
             root_dir: sector.root_cluster,
 
             vol_flags: sector.vol_flags as u32,
             vol_flags_persistent: (sector.vol_flags & (VOLUME_DIRTY | MEDIA_FAILURE)) as u32,
 
-            cluster_search_ptr: EXFAT_FIRST_CLUSTER,
+            cluster_search_ptr: LEARNED_FIRST_CLUSTER,
 
-            used_clusters: EXFAT_CLUSTERS_UNTRACKED,
+            used_clusters: LEARNED_CLUSTERS_UNTRACKED,
 
             dentries_per_clu: 1
                 << ((sector.sector_per_cluster_bits + sector.sector_size_bits) as u32
@@ -104,7 +104,7 @@ impl TryFrom<LearnedBootSector> for LearnedSuperBlock {
 pub const BOOTSEC_JUMP_BOOT_LEN: usize = 3;
 pub const BOOTSEC_FS_NAME_LEN: usize = 8;
 pub const BOOTSEC_OLDBPB_LEN: usize = 53;
-// EXFAT: Main and Backup Boot Sector (512 bytes)
+// LEARNED: Main and Backup Boot Sector (512 bytes)
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct LearnedBootSector {

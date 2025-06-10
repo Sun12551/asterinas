@@ -9,7 +9,7 @@ use align_ext::AlignExt;
 use bitvec::prelude::*;
 
 use super::{
-    constants::EXFAT_RESERVED_CLUSTERS,
+    constants::LEARNED_RESERVED_CLUSTERS,
     fat::ClusterID,
     fs::LearnedFS,
 };
@@ -42,7 +42,7 @@ impl LearnedBitmap {
         let start_offset = super_block.bitmap_start_sector as usize * super_block.sector_size as usize;
         fs.read_meta_at(start_offset, &mut buf)?;
         let mut free_cluster_num = 0;
-        for idx in 0..fs.super_block().num_clusters - EXFAT_RESERVED_CLUSTERS {
+        for idx in 0..fs.super_block().num_clusters - LEARNED_RESERVED_CLUSTERS {
             if (buf[idx as usize / BITS_PER_BYTE] & (1 << (idx % BITS_PER_BYTE as u32))) == 0 {
                 free_cluster_num += 1;
             }
@@ -94,7 +94,7 @@ impl LearnedBitmap {
         }
 
         for id in clusters {
-            if self.bitvec[(id - EXFAT_RESERVED_CLUSTERS) as usize] {
+            if self.bitvec[(id - LEARNED_RESERVED_CLUSTERS) as usize] {
                 return Ok(false);
             }
         }
@@ -120,8 +120,8 @@ impl LearnedBitmap {
             return_errno_with_message!(Errno::ENOSPC, "free contiguous clusters not available.")
         }
 
-        let mut cur_index = search_start_cluster - EXFAT_RESERVED_CLUSTERS;
-        let end_index = self.fs().super_block().num_clusters - EXFAT_RESERVED_CLUSTERS;
+        let mut cur_index = search_start_cluster - LEARNED_RESERVED_CLUSTERS;
+        let end_index = self.fs().super_block().num_clusters - LEARNED_RESERVED_CLUSTERS;
         let search_end_index = end_index - num_clusters + 1;
         let mut range_start_index: ClusterID;
 
@@ -137,8 +137,8 @@ impl LearnedBitmap {
                     cur_index += 1;
                 }
                 if cnt >= num_clusters {
-                    return Ok(range_start_index + EXFAT_RESERVED_CLUSTERS
-                        ..range_start_index + EXFAT_RESERVED_CLUSTERS + num_clusters);
+                    return Ok(range_start_index + LEARNED_RESERVED_CLUSTERS
+                        ..range_start_index + LEARNED_RESERVED_CLUSTERS + num_clusters);
                 }
             }
             cur_index += 1;
@@ -216,8 +216,8 @@ impl LearnedBitmap {
     ) -> Range<ClusterID> {
         let unit_size: u32 = (BITS_PER_BYTE * core::mem::size_of::<BitStore>()) as u32;
         let result_bit_index = cur_unit_index * unit_size + cur_unit_offset;
-        result_bit_index + EXFAT_RESERVED_CLUSTERS
-            ..result_bit_index + EXFAT_RESERVED_CLUSTERS + num_clusters
+        result_bit_index + LEARNED_RESERVED_CLUSTERS
+            ..result_bit_index + LEARNED_RESERVED_CLUSTERS + num_clusters
     }
 
     /// Return the next contiguous unused clusters, set cluster_num=1 to find a single cluster
@@ -235,10 +235,10 @@ impl LearnedBitmap {
 
         let bytes: &[BitStore] = self.bitvec.as_raw_slice();
         let unit_size: u32 = (BITS_PER_BYTE * core::mem::size_of::<BitStore>()) as u32;
-        let start_cluster_index = search_start_cluster - EXFAT_RESERVED_CLUSTERS;
+        let start_cluster_index = search_start_cluster - LEARNED_RESERVED_CLUSTERS;
         let mut cur_unit_index = start_cluster_index / unit_size;
         let mut cur_unit_offset = start_cluster_index % unit_size;
-        let total_cluster_num = self.fs().super_block().num_clusters - EXFAT_RESERVED_CLUSTERS;
+        let total_cluster_num = self.fs().super_block().num_clusters - LEARNED_RESERVED_CLUSTERS;
         let complete_unit_num = total_cluster_num / unit_size;
         let rest_cluster_num = total_cluster_num % unit_size;
         let valid_bytes_num = if rest_cluster_num > 0 {
@@ -310,7 +310,7 @@ impl LearnedBitmap {
         }
 
         for cluster_id in clusters.clone() {
-            let index = (cluster_id - EXFAT_RESERVED_CLUSTERS) as usize;
+            let index = (cluster_id - LEARNED_RESERVED_CLUSTERS) as usize;
             let old_bit = self.is_used(index);
             self.bitvec.set(index, bit);
 
@@ -328,9 +328,9 @@ impl LearnedBitmap {
 
     fn write_to_disk(&mut self, clusters: Range<ClusterID>, sync: bool) -> Result<()> {
         let unit_size = core::mem::size_of::<BitStore>() * BITS_PER_BYTE;
-        let start_byte_off: usize = (clusters.start - EXFAT_RESERVED_CLUSTERS) as usize / unit_size;
+        let start_byte_off: usize = (clusters.start - LEARNED_RESERVED_CLUSTERS) as usize / unit_size;
         let end_byte_off: usize =
-            ((clusters.end - EXFAT_RESERVED_CLUSTERS) as usize).align_up(unit_size) / unit_size;
+            ((clusters.end - LEARNED_RESERVED_CLUSTERS) as usize).align_up(unit_size) / unit_size;
 
         let bytes: &[BitStore] = self.bitvec.as_raw_slice();
         let byte_chunk = &bytes[start_byte_off..end_byte_off];

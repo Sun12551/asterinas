@@ -62,7 +62,7 @@ pub(super) struct LearnedInodeOnDisk {
     pub(super) reserved: [u8; 26],
 }
 
-pub(super) const LEARNED_INODE_ONDISK_SIZE: usize = 32;
+pub(super) const LEARNED_INODE_ONDISK_SIZE: usize = 64;
 
 impl LearnedInodeOnDisk {
     pub(super) fn new(fs: Arc<LearnedFS>) -> Result<Self> {
@@ -127,7 +127,6 @@ struct LearnedInodeInner {
     /// Number of sub inodes that are directories.
     num_sub_dirs: u32,
 
-    /// ExFAT uses UTF-16 encoding, rust use utf-8 for string processing.
     name: String,
 
     /// Flag for whether the inode is deleted.
@@ -136,7 +135,7 @@ struct LearnedInodeInner {
     /// The hash of its parent inode.
     parent_hash: usize,
 
-    /// A pointer to exFAT fs.
+    /// A pointer to learned fs.
     fs: Weak<LearnedFS>,
 
     /// Important: To enlarge the page_cache, we need to update the page_cache size before we update the size of inode, to avoid extra data read.
@@ -342,8 +341,35 @@ impl LearnedInodeInner {
             return Ok((offset, 0));
         }
 
-        let mut rest = dir_cnt;
-        let mut iter_start_offset_in_segment = offset;
+        // println!("[learned_fs] visit_sub_inodes: offset {}, dir_cnt {}", offset, dir_cnt);
+        let read_from_buffer_cnt = if let Some(dentry_buffer) = &self.dentry_buffer {
+            if offset < dentry_buffer.len() {
+                // Read from the buffer.
+                let mut read_cnt = 0;
+                for (name, (ino, _type)) in dentry_buffer.iter().skip(offset) {
+                    if read_cnt >= dir_cnt {
+                        break;
+                    }
+                    visitor.visit(name, *ino, *_type, offset + read_cnt)?;
+                    read_cnt += 1;
+                }
+                read_cnt
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        // println!("[learned_fs] visit_sub_inodes: read_from_buffer_cnt {}", read_from_buffer_cnt);
+        if read_from_buffer_cnt >= dir_cnt {
+            // All entries are read from the buffer.
+            return Ok((offset + read_from_buffer_cnt, read_from_buffer_cnt));
+        }
+
+
+        let mut rest = dir_cnt - read_from_buffer_cnt;
+        let buffer_size = self.dentry_buffer.as_ref().map_or(0, |b| b.len());
+        let mut iter_start_offset_in_segment = offset - buffer_size;
         let mut dentry_global_offset = 0;
         for segment in self.segments.iter() {
             let segment_inner = segment.read();
@@ -554,8 +580,14 @@ impl LearnedInodeInner {
 
         if let Some(dentry_buffer) = &self.dentry_buffer {
             if let Some((ino, _type)) = dentry_buffer.get(name) {
+                // println!("[learned_fs] lookup_entry: found inode with ino {} for name {} in dentry buffer", ino, name);
                 return Ok(fs.find_opened_inode(*ino as usize).unwrap());
             }
+        }
+
+        if self.segments.is_empty() {
+            // No segments, no entries.
+            return_errno!(Errno::ENOENT);
         }
 
         let predicted = self.model.predict_position(name)?;
@@ -564,7 +596,9 @@ impl LearnedInodeInner {
         if dentry.is_deleted() {
             return_errno!(Errno::ENOENT);
         }
-        return Ok(fs.find_opened_inode(dentry.ino() as usize).unwrap());
+        let ino = dentry.ino();
+        // println!("[learned_fs] lookup_entry: found inode with ino {} for name {} in segment", ino, name);
+        return Ok(fs.find_opened_inode(ino as usize).unwrap());
     }
 }
 
@@ -620,7 +654,7 @@ impl LearnedInode {
                 num_sub_dirs: 0,
                 name,
                 is_deleted: false,
-                parent_hash: 0,
+                parent_hash: ROOT_INODE_HASH,
                 fs: fs_weak,
                 page_cache: PageCache::with_capacity(size, weak_self.clone() as _).unwrap(),
                 model: Model::new(),
@@ -750,10 +784,9 @@ impl LearnedInode {
         let raw_inode = LearnedInodeOnDisk::new(fs.clone())?;
         let temp_dentry = DirEntry::new(
             name.to_string(),
-            0, // inode number will be assigned later
+            fs.alloc_inode_number(),
             inode_type,
         );
-        let ino = fs.alloc_inode_number();
         let inode = Self::build_from_inode_on_disk(
             fs.clone(),
             &raw_inode,
@@ -761,6 +794,7 @@ impl LearnedInode {
             self.hash_index(),
             fs_guard,
         )?;
+        // println!("[learned_fs] add_entry: name {}, ino {}, type {:?}", name, inode.ino(), inode_type);
 
         let mut inner = self.inner.write();
         if inner.dentry_buffer.is_none() {
@@ -845,17 +879,21 @@ impl LearnedInode {
         self.inner.read().fs().remove_inode(inode.hash_index());
         // Try to remove the dentry from the buffer.
         let name = inode.inner.read().name.to_string();
+        let mut removed = false;
         if let Some(dentry_buffer) = &mut self.inner.write().dentry_buffer {
             if let Some(ino) = dentry_buffer.remove(&name) {
-                self.inner.write().update_metadata_for_delete(is_dir);
-                return Ok(());
+                removed = true;
+                // println!("[learned_fs] delete_entry: removed dentry {} with ino {} from buffer", name, ino.0);
             }
         }
-        // If not found in dentry buffer, we need to delete the dentry from the segment.
-        let predicted = self.inner.read().model.predict_position(&name)?;
-        let mut binding = predicted.segment.write();
-        let dentry = binding.search_mut(predicted.offset, &name)?;
-        dentry.mark_deleted();
+        if !removed {
+            // If not found in dentry buffer, we need to delete the dentry from the segment.
+            let predicted = self.inner.read().model.predict_position(&name)?;
+            let mut binding = predicted.segment.write();
+            let dentry = binding.search_mut(predicted.offset, &name)?;
+            dentry.mark_deleted();
+            // println!("[learned_fs] delete_entry: marked dentry {} with ino {} as deleted in segment", name, dentry.ino());
+        }
         self.inner.write().update_metadata_for_delete(is_dir);
         Ok(())
     }

@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use super::{
     bitmap::LearnedBitmap,
-    constants::{EXFAT_FIRST_CLUSTER, EXFAT_RESERVED_CLUSTERS},
+    constants::{LEARNED_FIRST_CLUSTER, LEARNED_RESERVED_CLUSTERS},
     fs::LearnedFS,
 };
 use aster_block::{
@@ -189,7 +189,7 @@ impl ExfatChain {
     }
 
     pub(super) fn physical_cluster_start_offset(&self) -> usize {
-        let cluster_num = (self.current - EXFAT_RESERVED_CLUSTERS) as usize;
+        let cluster_num = (self.current - LEARNED_RESERVED_CLUSTERS) as usize;
         (cluster_num * self.cluster_size())
             + self.fs().super_block().data_start_sector as usize
                 * self.fs().super_block().sector_size as usize
@@ -271,7 +271,7 @@ impl ExfatChain {
     ) -> Result<ClusterID> {
         // Search for a continuous chunk big enough
         let search_result =
-            bitmap.find_next_unused_cluster_range(EXFAT_FIRST_CLUSTER, num_to_be_allocated);
+            bitmap.find_next_unused_cluster_range(LEARNED_FIRST_CLUSTER, num_to_be_allocated);
 
         if let Ok(clusters) = search_result {
             bitmap.set_range_used(clusters.clone(), sync_bitmap)?;
@@ -297,7 +297,7 @@ impl ExfatChain {
         let fs = self.fs();
         let mut alloc_start_cluster = 0;
         let mut prev_cluster = 0;
-        let mut cur_cluster = EXFAT_FIRST_CLUSTER;
+        let mut cur_cluster = LEARNED_FIRST_CLUSTER;
         for i in 0..num_to_be_allocated {
             cur_cluster = bitmap.find_next_unused_cluster(cur_cluster)?;
             bitmap.set_used(cur_cluster, sync)?;

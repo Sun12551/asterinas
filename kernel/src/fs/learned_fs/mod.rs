@@ -30,7 +30,7 @@ mod test {
     use crate::{
         fs::{
             exfat::{
-                constants::{EXFAT_RESERVED_CLUSTERS, MAX_NAME_LENGTH},
+                constants::{LEARNED_RESERVED_CLUSTERS, MAX_NAME_LENGTH},
                 LearnedFS, LearnedMountOptions,
             },
             utils::{generate_random_operation, new_fs_in_memory, Inode, InodeMode, InodeType},
@@ -732,7 +732,7 @@ mod test {
         let initial_free_clusters = bitmap.num_free_clusters();
 
         let range_result =
-            bitmap.find_next_unused_cluster_range(EXFAT_RESERVED_CLUSTERS, total_bits_len);
+            bitmap.find_next_unused_cluster_range(LEARNED_RESERVED_CLUSTERS, total_bits_len);
         assert!(
             range_result.is_ok(),
             "Fail to get a free range with {:?} clusters",
@@ -790,7 +790,7 @@ mod test {
         let initial_free_clusters = bitmap.num_free_clusters();
 
         let range_result =
-            bitmap.find_next_unused_cluster_range(EXFAT_RESERVED_CLUSTERS, total_bits_len);
+            bitmap.find_next_unused_cluster_range(LEARNED_RESERVED_CLUSTERS, total_bits_len);
         assert!(
             range_result.is_ok(),
             "Fail to get a free range with {:?} clusters",
@@ -851,7 +851,7 @@ mod test {
         let total_bits_len = 1000;
 
         let range_result =
-            bitmap.find_next_unused_cluster_range(EXFAT_RESERVED_CLUSTERS, total_bits_len);
+            bitmap.find_next_unused_cluster_range(LEARNED_RESERVED_CLUSTERS, total_bits_len);
         assert!(
             range_result.is_ok(),
             "Fail to get a free range with {:?} clusters",
